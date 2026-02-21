@@ -1,0 +1,11 @@
+matplotlib
+japanize-matplotlib
+xlsxwriter
+
+streamlit
+requests
+pandas
+numpy
+matplotlib
+google-generativeai
+xlsxwriter
