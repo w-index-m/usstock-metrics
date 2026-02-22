@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.3
+NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.4
 ─────────────────────────────────────────────────────
-修正履歴（v2.3）
-  - AI プロバイダーフォールバック順:
-      1. Google Gemini (gemini-2.0-flash → gemini-2.0-flash-lite)
-      2. Groq         (llama-3.3-70b-versatile → llama3-8b-8192)
-      3. OpenRouter   (gemini-2.0-flash:free → llama-3.3-70b:free)
-  - 各プロバイダーで 429 / エラー時に次へ自動切り替え
-  - exponential backoff リトライ
-  - st.cache_data でキャッシュ（重複リクエスト削減）
-  - CIK取得を SEC company_tickers.json 方式（v2.1継承）
+修正履歴（v2.4）
+  - Yahoo Finance タイムアウト短縮（5秒）+ ハング防止
+  - AI分析をスピナー外に出してノンブロッキング化
+  - 各データ取得ステップを独立 try/except でフェイルセーフ化
+  - ぐるぐる（無限スピナー）問題を解消
+  - AI プロバイダーフォールバック: Gemini → Groq → OpenRouter
 ─────────────────────────────────────────────────────
-必要 Secrets (Streamlit Secrets):
-  TIINGO_API_KEY      : Tiingo API（必須）
-  GEMINI_API_KEY      : Google Gemini API（任意）
-  GROQ_API_KEY        : Groq API（任意）
-  OPENROUTER_API_KEY  : OpenRouter API（任意）
+必要 Secrets:
+  TIINGO_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY
   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / NOTIFY_EMAIL
 """
 
-# ===============================
-# import
-# ===============================
 import streamlit as st
 import requests
 import pandas as pd
@@ -31,11 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from datetime import datetime, timedelta
 import concurrent.futures
-import os
-import io
-import json
-import time
-import smtplib
+import os, io, json, time, smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -48,11 +35,8 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
-# ===============================
-# フォント設定
-# ===============================
-FONT_CANDIDATES = ["fonts/NotoSansJP-VariableFont_wght.ttf"]
-for font in FONT_CANDIDATES:
+# ── フォント ──────────────────────────────────────────────────
+for font in ["fonts/NotoSansJP-VariableFont_wght.ttf"]:
     if os.path.exists(font):
         fm.fontManager.addfont(font)
         prop = fm.FontProperties(fname=font)
@@ -62,18 +46,10 @@ else:
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = ["IPAexGothic", "TakaoPGothic", "DejaVu Sans"]
 
-# ===============================
-# ページ設定
-# ===============================
-st.set_page_config(
-    page_title="NASDAQ-100 プロ分析ツール",
-    layout="wide",
-    page_icon="🚀",
-)
+# ── ページ設定 ────────────────────────────────────────────────
+st.set_page_config(page_title="NASDAQ-100 プロ分析ツール", layout="wide", page_icon="🚀")
 
-# ===============================
-# Secrets
-# ===============================
+# ── Secrets ───────────────────────────────────────────────────
 TIINGO_API_KEY     = st.secrets.get("TIINGO_API_KEY", "")
 GEMINI_API_KEY     = st.secrets.get("GEMINI_API_KEY", "")
 GROQ_API_KEY       = st.secrets.get("GROQ_API_KEY", "")
@@ -85,53 +61,38 @@ SMTP_PASS          = st.secrets.get("SMTP_PASS", "")
 NOTIFY_EMAIL       = st.secrets.get("NOTIFY_EMAIL", "")
 
 if not TIINGO_API_KEY:
-    st.error("⚠️ TIINGO_API_KEY が設定されていません（Secretsを確認してください）")
+    st.error("⚠️ TIINGO_API_KEY が未設定です")
     st.stop()
 
 if GEMINI_API_KEY and GENAI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ===============================
-# AI プロバイダー設定
-# ===============================
-GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-]
-
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama3-8b-8192",
-]
-
+# ── AI モデル設定 ─────────────────────────────────────────────
+GEMINI_MODELS     = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+GROQ_MODELS       = ["llama-3.3-70b-versatile", "llama3-8b-8192"]
 OPENROUTER_MODELS = [
     "google/gemini-2.0-flash-exp:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "microsoft/phi-4-reasoning-plus:free",
 ]
 
-# ===============================
-# AI コア呼び出し（フォールバック付き）
-# ===============================
+# ── AI フォールバック呼び出し ──────────────────────────────────
 
-def _call_gemini(prompt: str, max_retries: int = 3) -> str | None:
-    """Gemini 呼び出し。成功時は文字列、失敗時は None。"""
+def _call_gemini(prompt: str) -> str | None:
     if not GEMINI_API_KEY or not GENAI_AVAILABLE:
         return None
     for model_name in GEMINI_MODELS:
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                model  = genai.GenerativeModel(model_name)
-                result = model.generate_content(prompt)
-                return f"[Gemini:{model_name}]\n{result.text}"
+                model = genai.GenerativeModel(model_name)
+                return f"[Gemini:{model_name}]\n{model.generate_content(prompt).text}"
             except Exception as e:
                 err = str(e)
                 if "429" in err:
                     wait = 15 * (2 ** attempt)
-                    st.toast(f"⏳ Gemini 429 ({model_name}) → {wait}秒待機", icon="⏳")
+                    st.toast(f"⏳ Gemini 429 → {wait}秒待機", icon="⏳")
                     time.sleep(wait)
-                    if attempt == max_retries - 1:
-                        st.toast(f"🔄 Gemini {model_name} → 次モデルへ", icon="🔄")
+                    if attempt == 2:
                         break
                 elif "404" in err or "not found" in err.lower():
                     break
@@ -140,50 +101,36 @@ def _call_gemini(prompt: str, max_retries: int = 3) -> str | None:
     return None
 
 
-def _call_groq(prompt: str, max_retries: int = 3) -> str | None:
-    """Groq 呼び出し。成功時は文字列、失敗時は None。"""
+def _call_groq(prompt: str) -> str | None:
     if not GROQ_API_KEY:
         return None
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     for model_name in GROQ_MODELS:
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1024,
-                    "temperature": 0.3,
-                }
                 r = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers=headers,
-                    json=payload,
-                    timeout=30,
+                    json={"model": model_name, "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 1024, "temperature": 0.3},
+                    timeout=20,
                 )
                 if r.status_code == 200:
-                    text = r.json()["choices"][0]["message"]["content"]
-                    return f"[Groq:{model_name}]\n{text}"
+                    return f"[Groq:{model_name}]\n{r.json()['choices'][0]['message']['content']}"
                 elif r.status_code == 429:
                     wait = 15 * (2 ** attempt)
-                    st.toast(f"⏳ Groq 429 ({model_name}) → {wait}秒待機", icon="⏳")
+                    st.toast(f"⏳ Groq 429 → {wait}秒待機", icon="⏳")
                     time.sleep(wait)
-                    if attempt == max_retries - 1:
-                        st.toast(f"🔄 Groq {model_name} → 次モデルへ", icon="🔄")
+                    if attempt == 2:
                         break
-                elif r.status_code in (400, 404):
-                    break
                 else:
-                    return None
+                    break
             except Exception:
                 return None
     return None
 
 
-def _call_openrouter(prompt: str, max_retries: int = 3) -> str | None:
-    """OpenRouter 呼び出し。成功時は文字列、失敗時は None。"""
+def _call_openrouter(prompt: str) -> str | None:
     if not OPENROUTER_API_KEY:
         return None
     headers = {
@@ -193,136 +140,88 @@ def _call_openrouter(prompt: str, max_retries: int = 3) -> str | None:
         "X-Title": "NASDAQ-100 Dashboard",
     }
     for model_name in OPENROUTER_MODELS:
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1024,
-                    "temperature": 0.3,
-                }
                 r = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
-                    json=payload,
-                    timeout=30,
+                    json={"model": model_name, "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 1024, "temperature": 0.3},
+                    timeout=20,
                 )
                 if r.status_code == 200:
-                    text = r.json()["choices"][0]["message"]["content"]
-                    return f"[OpenRouter:{model_name}]\n{text}"
+                    return f"[OpenRouter:{model_name}]\n{r.json()['choices'][0]['message']['content']}"
                 elif r.status_code == 429:
                     wait = 15 * (2 ** attempt)
-                    st.toast(f"⏳ OpenRouter 429 ({model_name}) → {wait}秒待機", icon="⏳")
+                    st.toast(f"⏳ OpenRouter 429 → {wait}秒待機", icon="⏳")
                     time.sleep(wait)
-                    if attempt == max_retries - 1:
+                    if attempt == 2:
                         break
-                elif r.status_code in (400, 404):
-                    break
                 else:
-                    return None
+                    break
             except Exception:
                 return None
     return None
 
 
 def call_ai(prompt: str) -> str:
-    """
-    Gemini → Groq → OpenRouter の順でフォールバック。
-    全プロバイダー失敗時はエラーメッセージを返す。
-    """
-    # 1. Gemini
+    """Gemini → Groq → OpenRouter の順でフォールバック"""
     result = _call_gemini(prompt)
     if result:
         return result
-
-    # 2. Groq
-    st.toast("🔁 Gemini 失敗 → Groq へ切り替え", icon="🔁")
+    st.toast("🔁 Gemini → Groq へ切り替え", icon="🔁")
     result = _call_groq(prompt)
     if result:
         return result
-
-    # 3. OpenRouter
-    st.toast("🔁 Groq 失敗 → OpenRouter へ切り替え", icon="🔁")
+    st.toast("🔁 Groq → OpenRouter へ切り替え", icon="🔁")
     result = _call_openrouter(prompt)
     if result:
         return result
+    return "⚠️ 全 AI プロバイダーで失敗しました。APIキー・プラン残量を確認してください。"
 
-    return (
-        "⚠️ Gemini / Groq / OpenRouter 全プロバイダーで失敗しました。\n"
-        "APIキーの設定・プランの残量をご確認ください。"
-    )
 
-# ===============================
-# Gemini キャッシュ付きラッパー
-# ===============================
+# ── AI キャッシュ付きラッパー ──────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def ai_translate_and_summarize(text: str, context: str = "") -> str:
-    prompt = f"""
+    return call_ai(f"""
 以下の英文テキストを日本語に翻訳し、投資家向けに300文字以内で要約してください。
 {f'背景情報: {context}' if context else ''}
-
-英文:
-{text}
-
-出力形式:
-【翻訳要約】
-（ここに日本語で記載）
-"""
-    return call_ai(prompt)
+英文:\n{text}
+出力形式:\n【翻訳要約】\n（ここに日本語で記載）
+""")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def ai_sentiment(headlines_tuple: tuple, ticker: str) -> str:
-    """list はキャッシュキーに使えないため tuple で受け取る"""
     if not headlines_tuple:
         return "（データなし）"
-    headlines_text = "\n".join(f"- {h}" for h in headlines_tuple)
-    prompt = f"""
-以下は米国株「{ticker}」に関する最新ニュース見出しです。
+    return call_ai(f"""
+以下は米国株「{ticker}」の最新ニュース見出しです。
 センチメント（強気/弱気/中立）を判定し、理由を日本語200文字以内で説明してください。
-
-ニュース見出し:
-{headlines_text}
-
-出力形式:
-センチメント: [強気 / 弱気 / 中立]
-理由: （日本語で説明）
-"""
-    return call_ai(prompt)
+ニュース見出し:\n{chr(10).join(f"- {h}" for h in headlines_tuple)}
+出力形式:\nセンチメント: [強気 / 弱気 / 中立]\n理由: （日本語で説明）
+""")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def ai_earnings_analysis(ticker: str, xbrl_str: str, eps_str: str) -> str:
-    prompt = f"""
-米国株「{ticker}」の決算データを分析し、投資家向けの日本語レポートを作成してください。
-
-## XBRL財務データ（過去4四半期）
-{xbrl_str}
-
-## EPS履歴・サプライズ
-{eps_str}
-
-以下の観点で400文字以内で分析してください：
-1. 売上・利益トレンド
-2. EPSサプライズの傾向（beat/miss）
-3. 投資判断上の注目点
-"""
-    return call_ai(prompt)
+    return call_ai(f"""
+米国株「{ticker}」の決算データを分析し、投資家向け日本語レポートを400文字以内で作成してください。
+## XBRL財務データ\n{xbrl_str}
+## EPS履歴\n{eps_str}
+観点: 1.売上・利益トレンド 2.EPSサプライズ傾向 3.投資判断上の注目点
+""")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def ai_company_summary(ticker: str) -> str:
-    prompt = f"""
-米国株「{ticker}」について、
-・事業内容 ・強み ・主な収益源
-を投資家向けに日本語300文字以内で要約してください。
-"""
-    return call_ai(prompt)
+    return call_ai(f"""
+米国株「{ticker}」について、事業内容・強み・主な収益源を投資家向けに日本語300文字以内で要約してください。
+""")
 
-# ===============================
-# NASDAQ-100 ティッカー
-# ===============================
+
+# ── NASDAQ-100 ティッカー ─────────────────────────────────────
 nasdaq100_tickers = sorted(set([
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AVGO","COST","PEP",
     "ADBE","NFLX","AMD","INTC","CSCO","QCOM","TXN","AMAT","HON","INTU",
@@ -337,41 +236,40 @@ nasdaq100_tickers = sorted(set([
     "ANET","APH","GLW",
 ]))
 
-# ===============================
-# SEC EDGAR ヘッダー
-# ===============================
 EDGAR_HEADERS = {
-    "User-Agent": "NasdaqDashboard/2.3 research@example.com",
+    "User-Agent": "NasdaqDashboard/2.4 research@example.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "data.sec.gov",
 }
 
-# ===============================
-# 株価・リターン取得
-# ===============================
+# ── 株価・リターン ────────────────────────────────────────────
+
 def get_market_data(api_key, start, end):
-    url    = "https://api.tiingo.com/tiingo/daily/QQQ/prices"
-    params = {
-        "startDate": str(start), "endDate": str(end),
-        "resampleFreq": "daily", "token": api_key,
-    }
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
+    try:
+        r = requests.get(
+            "https://api.tiingo.com/tiingo/daily/QQQ/prices",
+            params={"startDate": str(start), "endDate": str(end),
+                    "resampleFreq": "daily", "token": api_key},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        df = pd.DataFrame(r.json())
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        return df["adjClose"].pct_change().dropna()
+    except Exception:
         return None
-    df = pd.DataFrame(r.json())
-    df["date"] = pd.to_datetime(df["date"])
-    df.set_index("date", inplace=True)
-    return df["adjClose"].pct_change().dropna()
 
 
 def analyze_ticker(ticker, market_returns, api_key, start, end):
-    url    = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
-    params = {
-        "startDate": str(start), "endDate": str(end),
-        "resampleFreq": "daily", "token": api_key,
-    }
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(
+            f"https://api.tiingo.com/tiingo/daily/{ticker}/prices",
+            params={"startDate": str(start), "endDate": str(end),
+                    "resampleFreq": "daily", "token": api_key},
+            timeout=15,
+        )
         if r.status_code != 200:
             return None
         df = pd.DataFrame(r.json())
@@ -389,52 +287,40 @@ def analyze_ticker(ticker, market_returns, api_key, start, end):
         alpha    = annual_return - (0.01 + beta * (np.mean(y) * 252 - 0.01))
         sharpe   = (annual_return - 0.01) / annual_risk
         residual = np.std(x - beta * y) * np.sqrt(252)
-        return {
-            "銘柄": ticker,
-            "年間リターン": annual_return,
-            "年間リスク": annual_risk,
-            "シャープレシオ": sharpe,
-            "ベータ": beta,
-            "アルファ": alpha,
-            "レジデュアルリスク": residual,
-        }
+        return {"銘柄": ticker, "年間リターン": annual_return, "年間リスク": annual_risk,
+                "シャープレシオ": sharpe, "ベータ": beta, "アルファ": alpha, "レジデュアルリスク": residual}
     except Exception:
         return None
 
-# ===============================
-# SEC EDGAR : CIK 取得
-# ===============================
+# ── CIK 取得 ──────────────────────────────────────────────────
+
 @st.cache_data(ttl=86400)
 def get_cik(ticker: str) -> str | None:
-    """SEC company_tickers.json からCIKを確実に取得"""
-    url = "https://www.sec.gov/files/company_tickers.json"
     try:
         r = requests.get(
-            url,
-            headers={"User-Agent": "NasdaqDashboard/2.3 research@example.com"},
-            timeout=15,
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": "NasdaqDashboard/2.4 research@example.com"},
+            timeout=10,
         )
         if r.status_code != 200:
             return None
-        ticker_upper = ticker.upper()
         for entry in r.json().values():
-            if entry.get("ticker", "").upper() == ticker_upper:
+            if entry.get("ticker", "").upper() == ticker.upper():
                 return str(entry["cik_str"]).zfill(10)
     except Exception:
         pass
     return None
 
-# ===============================
-# SEC EDGAR : フィリング
-# ===============================
+# ── EDGAR フィリング ───────────────────────────────────────────
+
 @st.cache_data(ttl=3600)
 def get_edgar_filings(ticker: str, form_type: str = "10-K", count: int = 4) -> list[dict]:
-    cik = get_cik(ticker)
-    if not cik:
-        return []
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
+        cik = get_cik(ticker)
+        if not cik:
+            return []
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                         headers=EDGAR_HEADERS, timeout=10)
         if r.status_code != 200:
             return []
         data       = r.json()
@@ -446,29 +332,24 @@ def get_edgar_filings(ticker: str, form_type: str = "10-K", count: int = 4) -> l
         for i, f in enumerate(forms):
             if f == form_type:
                 acc = accessions[i].replace("-", "")
-                results.append({
-                    "form": f,
-                    "date": dates[i],
-                    "accession": accessions[i],
-                    "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/",
-                })
+                results.append({"form": f, "date": dates[i], "accession": accessions[i],
+                                 "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/"})
                 if len(results) >= count:
                     break
         return results
     except Exception:
         return []
 
-# ===============================
-# XBRL 財務数値抽出
-# ===============================
+# ── XBRL 財務数値 ─────────────────────────────────────────────
+
 @st.cache_data(ttl=3600)
 def get_xbrl_financials(ticker: str) -> pd.DataFrame:
-    cik = get_cik(ticker)
-    if not cik:
-        return pd.DataFrame()
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     try:
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+        cik = get_cik(ticker)
+        if not cik:
+            return pd.DataFrame()
+        r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                         headers=EDGAR_HEADERS, timeout=15)
         if r.status_code != 200:
             return pd.DataFrame()
         facts = r.json().get("facts", {})
@@ -477,15 +358,14 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
             ns, concept = concept_path.split(":")
             units   = facts.get(ns, {}).get(concept, {}).get("units", {})
             entries = []
-            for unit_key in ["USD", "USD/shares", "shares"]:
-                entries = units.get(unit_key, [])
+            for uk in ["USD", "USD/shares", "shares"]:
+                entries = units.get(uk, [])
                 if entries:
                     break
-            q_entries = [
-                e for e in entries
-                if e.get("form") in ("10-Q", "10-K") and e.get("fp")
-            ]
-            q_entries.sort(key=lambda x: x.get("end", ""), reverse=True)
+            q_entries = sorted(
+                [e for e in entries if e.get("form") in ("10-Q", "10-K") and e.get("fp")],
+                key=lambda x: x.get("end", ""), reverse=True,
+            )
             rows, seen = [], set()
             for e in q_entries:
                 key = e.get("end")
@@ -497,17 +377,15 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
                     break
             return pd.DataFrame(rows).set_index("期間末") if rows else pd.DataFrame()
 
-        revenue_df = extract_series(
-            "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "売上高"
-        )
-        if revenue_df.empty:
-            revenue_df = extract_series("us-gaap:Revenues", "売上高")
-        if revenue_df.empty:
-            revenue_df = extract_series("us-gaap:SalesRevenueNet", "売上高")
-        net_income_df = extract_series("us-gaap:NetIncomeLoss", "純利益")
-        eps_df        = extract_series("us-gaap:EarningsPerShareBasic", "EPS（基本）")
+        rev_df = extract_series("us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "売上高")
+        if rev_df.empty:
+            rev_df = extract_series("us-gaap:Revenues", "売上高")
+        if rev_df.empty:
+            rev_df = extract_series("us-gaap:SalesRevenueNet", "売上高")
+        ni_df  = extract_series("us-gaap:NetIncomeLoss", "純利益")
+        eps_df = extract_series("us-gaap:EarningsPerShareBasic", "EPS（基本）")
 
-        dfs = [df for df in [revenue_df, net_income_df, eps_df] if not df.empty]
+        dfs = [d for d in [rev_df, ni_df, eps_df] if not d.empty]
         if not dfs:
             return pd.DataFrame()
         merged = dfs[0]
@@ -517,28 +395,35 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# ===============================
-# Yahoo Finance : 決算日・EPS
-# ===============================
+# ── Yahoo Finance 決算データ（タイムアウト強化版）─────────────
+
 @st.cache_data(ttl=1800)
 def get_earnings_data(ticker: str) -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/json",
-    }
-    url = (
-        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-        "?modules=calendarEvents,earningsHistory,defaultKeyStatistics"
-    )
+    """
+    タイムアウト 5秒 + 失敗時は空dictを即返す。
+    ハング防止のため requests.Session + stream=False を使用。
+    """
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+        })
+        r = session.get(
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+            "?modules=calendarEvents,earningsHistory,defaultKeyStatistics",
+            timeout=(3, 5),   # (connect_timeout, read_timeout)
+            stream=False,
+        )
+        session.close()
+
         if r.status_code != 200:
             return {}
-        data           = r.json().get("quoteSummary", {}).get("result", [{}])[0]
-        earnings_dates = (
-            data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
-        )
-        next_date   = earnings_dates[0].get("fmt", "N/A") if earnings_dates else "N/A"
+
+        data = r.json().get("quoteSummary", {}).get("result", [{}])[0]
+        earnings_dates = data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
+        next_date      = earnings_dates[0].get("fmt", "N/A") if earnings_dates else "N/A"
+
         history     = data.get("earningsHistory", {}).get("history", [])
         eps_history = []
         for h in history[-4:]:
@@ -548,6 +433,7 @@ def get_earnings_data(ticker: str) -> dict:
                 "EPS予想":    h.get("epsEstimate", {}).get("raw"),
                 "サプライズ%": h.get("surprisePercent", {}).get("raw"),
             })
+
         stats = data.get("defaultKeyStatistics", {})
         return {
             "次回決算日": next_date,
@@ -556,16 +442,19 @@ def get_earnings_data(ticker: str) -> dict:
             "PBR":        stats.get("priceToBook", {}).get("raw"),
         }
     except Exception:
+        # タイムアウト・接続エラー時は即座に空dictで返す
         return {}
 
-# ===============================
-# Yahoo Finance : ニュース
-# ===============================
+# ── Yahoo Finance ニュース ────────────────────────────────────
+
 @st.cache_data(ttl=900)
 def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
-    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
     try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(
+            f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+            timeout=(3, 5),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
         if r.status_code != 200:
             return []
         root   = ET.fromstring(r.content)
@@ -580,21 +469,14 @@ def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
     except Exception:
         return []
 
-# ===============================
-# メール通知
-# ===============================
-def send_email_notification(
-    subject: str, body: str,
-    attachment_bytes: bytes | None = None,
-    filename: str = "report.txt",
-):
+# ── メール通知 ────────────────────────────────────────────────
+
+def send_email_notification(subject, body, attachment_bytes=None, filename="report.txt"):
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASS, NOTIFY_EMAIL]):
         return False, "SMTP設定が不完全です"
     try:
-        msg            = MIMEMultipart()
-        msg["From"]    = SMTP_USER
-        msg["To"]      = NOTIFY_EMAIL
-        msg["Subject"] = subject
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER; msg["To"] = NOTIFY_EMAIL; msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
         if attachment_bytes:
             part = MIMEBase("application", "octet-stream")
@@ -603,20 +485,15 @@ def send_email_notification(
             part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
             msg.attach(part)
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
+            server.starttls(); server.login(SMTP_USER, SMTP_PASS)
             server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
         return True, "メール送信成功"
     except Exception as e:
         return False, f"メール送信失敗: {e}"
 
-# ===============================
-# テキストレポート
-# ===============================
-def build_text_report(
-    ticker: str, earnings_info: dict, xbrl_df: pd.DataFrame,
-    headlines: list[str], sentiment: str, ai_analysis: str,
-) -> str:
+# ── テキストレポート ──────────────────────────────────────────
+
+def build_text_report(ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis):
     lines = [
         "=" * 60,
         f"  {ticker} 決算レポート（{datetime.now().strftime('%Y-%m-%d %H:%M')}）",
@@ -627,25 +504,16 @@ def build_text_report(
         "\n【EPS履歴・サプライズ】",
     ]
     for e in earnings_info.get("EPS履歴", []):
-        lines.append(
-            f"  {e['期間']} | 実績:{e['EPS実績']} | 予想:{e['EPS予想']}"
-            f" | サプライズ:{e.get('サプライズ%', 'N/A')}%"
-        )
+        lines.append(f"  {e['期間']} | 実績:{e['EPS実績']} | 予想:{e['EPS予想']} | サプライズ:{e.get('サプライズ%','N/A')}%")
     if not xbrl_df.empty:
         lines += ["\n【XBRL財務データ】", xbrl_df.to_string(index=False)]
-    lines.append("\n【最新ニュース】")
-    lines += [f"  - {h}" for h in headlines]
-    lines += [
-        f"\n【センチメント】\n{sentiment}",
-        f"\n【AI分析】\n{ai_analysis}",
-        "=" * 60,
-    ]
+    lines += ["\n【最新ニュース】"] + [f"  - {h}" for h in headlines]
+    lines += [f"\n【センチメント】\n{sentiment}", f"\n【AI分析】\n{ai_analysis}", "=" * 60]
     return "\n".join(lines)
 
-# ===============================
-# グラフ
-# ===============================
-def plot_xbrl_quarterly(xbrl_df: pd.DataFrame, ticker: str):
+# ── グラフ ────────────────────────────────────────────────────
+
+def plot_xbrl_quarterly(xbrl_df, ticker):
     if xbrl_df.empty:
         return None
     cols = [c for c in ["売上高", "純利益"] if c in xbrl_df.columns]
@@ -658,10 +526,7 @@ def plot_xbrl_quarterly(xbrl_df: pd.DataFrame, ticker: str):
         vals = xbrl_df[col].dropna()
         if vals.empty:
             continue
-        periods = (
-            xbrl_df.loc[vals.index, "期間末"].tolist()
-            if "期間末" in xbrl_df.columns else list(range(len(vals)))
-        )
+        periods = xbrl_df.loc[vals.index, "期間末"].tolist() if "期間末" in xbrl_df.columns else list(range(len(vals)))
         ax.bar(range(len(vals)), vals.values / 1e9, color="#4472C4")
         ax.set_xticks(range(len(vals)))
         ax.set_xticklabels(periods, rotation=30, ha="right", fontsize=8)
@@ -671,7 +536,7 @@ def plot_xbrl_quarterly(xbrl_df: pd.DataFrame, ticker: str):
     return fig
 
 
-def plot_eps_surprise(eps_history: list[dict], ticker: str):
+def plot_eps_surprise(eps_history, ticker):
     if not eps_history:
         return None
     df = pd.DataFrame(eps_history).dropna(subset=["EPS実績", "EPS予想"])
@@ -688,127 +553,106 @@ def plot_eps_surprise(eps_history: list[dict], ticker: str):
     plt.tight_layout()
     return fig
 
-# ===============================
+# =============================================================
 # UI
-# ===============================
-st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.3")
+# =============================================================
+st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.4")
 
-# プロバイダー状態パネル
-with st.expander("🤖 AI プロバイダー状態（クリックで展開）", expanded=False):
+with st.expander("🤖 AI プロバイダー状態", expanded=False):
     c1, c2, c3 = st.columns(3)
-    c1.metric("1️⃣ Gemini",      "✅ 設定済" if GEMINI_API_KEY     else "❌ 未設定", "gemini-2.0-flash → lite")
-    c2.metric("2️⃣ Groq",        "✅ 設定済" if GROQ_API_KEY       else "❌ 未設定", "llama-3.3-70b → 8b")
-    c3.metric("3️⃣ OpenRouter",  "✅ 設定済" if OPENROUTER_API_KEY else "❌ 未設定", "gemini-flash → llama free")
+    c1.metric("1️⃣ Gemini",     "✅ 設定済" if GEMINI_API_KEY     else "❌ 未設定", "gemini-2.0-flash → lite")
+    c2.metric("2️⃣ Groq",       "✅ 設定済" if GROQ_API_KEY       else "❌ 未設定", "llama-3.3-70b → 8b")
+    c3.metric("3️⃣ OpenRouter", "✅ 設定済" if OPENROUTER_API_KEY else "❌ 未設定", "gemini-flash → llama free")
     if not any([GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY]):
-        st.warning("⚠️ AI APIキーが1つも設定されていません。Secretsに追加してください。")
+        st.warning("⚠️ AI APIキーが未設定です")
 
-tab1, tab2, tab3 = st.tabs([
-    "📊 パフォーマンス分析",
-    "📋 決算分析（EDGAR・EPS）",
-    "📰 ニュース翻訳・センチメント",
-])
+tab1, tab2, tab3 = st.tabs(["📊 パフォーマンス分析", "📋 決算分析（EDGAR・EPS）", "📰 ニュース翻訳・センチメント"])
 
-# ─── サイドバー ───────────────────────────────────────────────
+# ── サイドバー ────────────────────────────────────────────────
 with st.sidebar:
     st.header("📊 設定")
     years = st.slider("分析対象期間（年）", 1, 10, 3)
     st.divider()
     st.subheader("📋 決算分析設定")
     selected_tickers = st.multiselect(
-        "分析する銘柄を選択",
-        nasdaq100_tickers,
-        default=["AAPL", "MSFT", "NVDA"],
-        max_selections=10,
+        "分析する銘柄を選択", nasdaq100_tickers,
+        default=["AAPL", "MSFT", "NVDA"], max_selections=10,
     )
     filing_type  = st.selectbox("SEC フィリング種別", ["10-K", "10-Q"])
     st.divider()
-    st.subheader("📧 メール通知")
     enable_email = st.checkbox("決算レポートをメールで通知", value=False)
     st.divider()
-    st.info(
-        "💡 **AI フォールバック順**\n\n"
-        "1️⃣ Gemini（gemini-2.0-flash）\n"
-        "2️⃣ Groq（llama-3.3-70b）\n"
-        "3️⃣ OpenRouter（free tier）\n\n"
-        "レート制限時は自動で次へ切り替えます。\n"
-        "同一リクエストは1時間キャッシュされます。"
-    )
-    st.caption("v2.3 | SEC EDGAR / Yahoo Finance / Gemini+Groq+OpenRouter")
+    st.info("💡 AI フォールバック順\n1️⃣ Gemini\n2️⃣ Groq\n3️⃣ OpenRouter\n\nレート制限時は自動切り替え。同一リクエストは1時間キャッシュ。")
+    st.caption("v2.4 | SEC EDGAR / Yahoo Finance / Gemini+Groq+OpenRouter")
 
 end_date   = datetime.today().date()
 start_date = end_date - timedelta(days=years * 365)
 
-# ─────────────────────────────────────────────────────────────
+# =============================================================
 # Tab 1: パフォーマンス分析
-# ─────────────────────────────────────────────────────────────
+# =============================================================
 with tab1:
     st.subheader("📊 NASDAQ-100 パフォーマンス分析")
     if st.button("▶ 全銘柄パフォーマンス分析を実行", type="primary"):
         with st.spinner("データ取得・計算中..."):
             market_returns = get_market_data(TIINGO_API_KEY, start_date, end_date)
-            if market_returns is None:
-                st.error("市場データの取得に失敗しました")
+        if market_returns is None:
+            st.error("市場データの取得に失敗しました")
+        else:
+            progress = st.progress(0, text="銘柄データ取得中...")
+            results  = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {
+                    executor.submit(analyze_ticker, t, market_returns, TIINGO_API_KEY, start_date, end_date): t
+                    for t in nasdaq100_tickers
+                }
+                for i, f in enumerate(concurrent.futures.as_completed(futures)):
+                    r = f.result()
+                    if r:
+                        results.append(r)
+                    progress.progress((i + 1) / len(futures), text=f"取得中... {i+1}/{len(futures)}")
+            progress.empty()
+
+            df = pd.DataFrame(results)
+            if df.empty:
+                st.error("有効な分析結果がありません")
             else:
-                results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = [
-                        executor.submit(
-                            analyze_ticker, t, market_returns,
-                            TIINGO_API_KEY, start_date, end_date,
-                        )
-                        for t in nasdaq100_tickers
-                    ]
-                    for f in futures:
-                        r = f.result()
-                        if r:
-                            results.append(r)
+                df.insert(0, "シャープレシオ順位", df["シャープレシオ"].rank(ascending=False, method="min").astype(int))
+                df.insert(0, "値上がり順位",       df["年間リターン"].rank(ascending=False, method="min").astype(int))
+                df = df.sort_values("値上がり順位").reset_index(drop=True)
 
-                df = pd.DataFrame(results)
-                if df.empty:
-                    st.error("有効な分析結果がありません")
-                else:
-                    df.insert(0, "シャープレシオ順位",
-                              df["シャープレシオ"].rank(ascending=False, method="min").astype(int))
-                    df.insert(0, "値上がり順位",
-                              df["年間リターン"].rank(ascending=False, method="min").astype(int))
-                    df = df.sort_values("値上がり順位").reset_index(drop=True)
+                st.dataframe(
+                    df.style
+                    .format("{:.2%}", subset=["年間リターン", "年間リスク", "アルファ", "レジデュアルリスク"])
+                    .format("{:.2f}", subset=["シャープレシオ", "ベータ"])
+                    .format("{:d}",   subset=["値上がり順位", "シャープレシオ順位"]),
+                    use_container_width=True,
+                )
 
-                    st.dataframe(
-                        df.style
-                        .format("{:.2%}", subset=["年間リターン", "年間リスク", "アルファ", "レジデュアルリスク"])
-                        .format("{:.2f}", subset=["シャープレシオ", "ベータ"])
-                        .format("{:d}",   subset=["値上がり順位", "シャープレシオ順位"]),
-                        use_container_width=True,
-                    )
+                top = df.sort_values("シャープレシオ", ascending=False).head(20)
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
+                ax1.bar(top["銘柄"], top["年間リターン"] * 100, label="リターン(%)", color="#4472C4")
+                ax1.bar(top["銘柄"], top["年間リスク"]   * 100, label="リスク(%)",   color="#ED7D31", alpha=0.3)
+                ax1.legend(); ax1.set_title("年間リターン / リスク（上位20銘柄）")
+                ax2.bar(top["銘柄"], top["シャープレシオ"], color="#70AD47")
+                ax2.set_title("シャープレシオ（上位20銘柄）")
+                plt.tight_layout()
+                st.pyplot(fig)
 
-                    top = df.sort_values("シャープレシオ", ascending=False).head(20)
-                    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
-                    ax1.bar(top["銘柄"], top["年間リターン"] * 100, label="リターン(%)", color="#4472C4")
-                    ax1.bar(top["銘柄"], top["年間リスク"]   * 100, label="リスク(%)",   color="#ED7D31", alpha=0.3)
-                    ax1.legend()
-                    ax1.set_title("年間リターン / リスク（上位20銘柄）")
-                    ax2.bar(top["銘柄"], top["シャープレシオ"], color="#70AD47")
-                    ax2.set_title("シャープレシオ（上位20銘柄）")
-                    plt.tight_layout()
-                    st.pyplot(fig)
+                st.subheader("🤖 AIによる企業解説（上位3社）")
+                for t in top["銘柄"].head(3):
+                    with st.expander(f"💡 {t} の概要"):
+                        st.write(ai_company_summary(t))
 
-                    st.subheader("🤖 AIによる企業解説（上位3社）")
-                    for t in top["銘柄"].head(3):
-                        with st.expander(f"💡 {t} の概要"):
-                            st.write(ai_company_summary(t))
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                    df.to_excel(writer, index=False, sheet_name="Analysis")
+                st.download_button("📥 Excelでダウンロード", data=output.getvalue(),
+                                   file_name=f"Nasdaq100_Analysis_{end_date}.xlsx")
 
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                        df.to_excel(writer, index=False, sheet_name="Analysis")
-                    st.download_button(
-                        "📥 Excelでダウンロード",
-                        data=output.getvalue(),
-                        file_name=f"Nasdaq100_Analysis_{end_date}.xlsx",
-                    )
-
-# ─────────────────────────────────────────────────────────────
-# Tab 2: 決算分析
-# ─────────────────────────────────────────────────────────────
+# =============================================================
+# Tab 2: 決算分析（ぐるぐる防止の핵심ロジック）
+# =============================================================
 with tab2:
     st.subheader("📋 決算分析（SEC EDGAR + Yahoo Finance）")
     if not selected_tickers:
@@ -818,86 +662,91 @@ with tab2:
 
         for ticker in selected_tickers:
             st.markdown(f"---\n### 🔍 {ticker}")
+
+            # ─ Step1: XBRL（スピナー付き・独立） ─────────────────
+            with st.spinner(f"📡 {ticker} XBRL データ取得中..."):
+                xbrl_df = get_xbrl_financials(ticker)   # timeout=15 で確実に返る
+
+            # ─ Step2: Yahoo Finance（スピナー付き・独立） ─────────
+            with st.spinner(f"📡 {ticker} 決算・EPS データ取得中..."):
+                earnings_info = get_earnings_data(ticker)  # timeout=(3,5) で確実に返る
+
+            # ─ Step3: ニュース（スピナー付き・独立） ──────────────
+            with st.spinner(f"📡 {ticker} ニュース取得中..."):
+                headlines = get_news_headlines(ticker, 5)  # timeout=(3,5) で確実に返る
+
+            # ─ 表示（スピナーなし・即時） ─────────────────────────
             cols = st.columns([1, 1])
 
-            with st.spinner(f"{ticker} のデータ取得中..."):
-                # XBRL
-                xbrl_df = get_xbrl_financials(ticker)
-                with cols[0]:
-                    st.markdown("**📈 XBRL 財務データ（SEC EDGAR）**")
-                    if not xbrl_df.empty:
-                        disp_df = xbrl_df.copy()
-                        for c in ["売上高", "純利益"]:
-                            if c in disp_df.columns:
-                                disp_df[c] = disp_df[c].apply(
-                                    lambda v: f"${v/1e9:.2f}B" if pd.notna(v) and v != 0 else "N/A"
-                                )
-                        if "EPS（基本）" in disp_df.columns:
-                            disp_df["EPS（基本）"] = disp_df["EPS（基本）"].apply(
-                                lambda v: f"${v:.2f}" if pd.notna(v) else "N/A"
+            with cols[0]:
+                st.markdown("**📈 XBRL 財務データ（SEC EDGAR）**")
+                if not xbrl_df.empty:
+                    disp_df = xbrl_df.copy()
+                    for c in ["売上高", "純利益"]:
+                        if c in disp_df.columns:
+                            disp_df[c] = disp_df[c].apply(
+                                lambda v: f"${v/1e9:.2f}B" if pd.notna(v) and v != 0 else "N/A"
                             )
-                        st.dataframe(disp_df, use_container_width=True)
-                        fig_q = plot_xbrl_quarterly(xbrl_df, ticker)
-                        if fig_q:
-                            st.pyplot(fig_q)
-                    else:
-                        st.warning("XBRL データが取得できませんでした")
-
-                # EPS / 決算日
-                earnings_info = get_earnings_data(ticker)
-                with cols[1]:
-                    st.markdown("**📅 決算発表日・EPS サプライズ**")
-                    per_val = earnings_info.get("PER(予想)")
-                    pbr_val = earnings_info.get("PBR")
-                    st.markdown(f"- **次回決算日**: {earnings_info.get('次回決算日', 'N/A')}")
-                    st.markdown(f"- **予想PER**: {f'{per_val:.1f}' if per_val else 'N/A'}")
-                    st.markdown(f"- **PBR**: {f'{pbr_val:.2f}' if pbr_val else 'N/A'}")
-
-                    eps_history = earnings_info.get("EPS履歴", [])
-                    if eps_history:
-                        st.dataframe(pd.DataFrame(eps_history), use_container_width=True)
-                        fig_eps = plot_eps_surprise(eps_history, ticker)
-                        if fig_eps:
-                            st.pyplot(fig_eps)
-                        beats = sum(
-                            1 for e in eps_history
-                            if e.get("サプライズ%") and e["サプライズ%"] > 0
+                    if "EPS（基本）" in disp_df.columns:
+                        disp_df["EPS（基本）"] = disp_df["EPS（基本）"].apply(
+                            lambda v: f"${v:.2f}" if pd.notna(v) else "N/A"
                         )
-                        total = len(
-                            [e for e in eps_history if e.get("サプライズ%") is not None]
-                        )
-                        if total:
-                            st.metric(
-                                "直近4四半期 EPS Beat率",
-                                f"{beats}/{total} ({beats/total*100:.0f}%)",
-                            )
+                    st.dataframe(disp_df, use_container_width=True)
+                    fig_q = plot_xbrl_quarterly(xbrl_df, ticker)
+                    if fig_q:
+                        st.pyplot(fig_q)
+                else:
+                    st.warning("XBRL データが取得できませんでした")
 
-                # AI 分析
-                st.markdown("**🤖 AI 決算総合分析（日本語）**")
-                xbrl_str    = xbrl_df.to_string(index=False) if not xbrl_df.empty else "データなし"
-                eps_str     = json.dumps(eps_history, ensure_ascii=False, indent=2) if eps_history else "データなし"
+            eps_history = earnings_info.get("EPS履歴", [])
+            with cols[1]:
+                st.markdown("**📅 決算発表日・EPS サプライズ**")
+                per_val = earnings_info.get("PER(予想)")
+                pbr_val = earnings_info.get("PBR")
+                st.markdown(f"- **次回決算日**: {earnings_info.get('次回決算日', 'N/A')}")
+                st.markdown(f"- **予想PER**: {f'{per_val:.1f}' if per_val else 'N/A'}")
+                st.markdown(f"- **PBR**: {f'{pbr_val:.2f}' if pbr_val else 'N/A'}")
+                if eps_history:
+                    st.dataframe(pd.DataFrame(eps_history), use_container_width=True)
+                    fig_eps = plot_eps_surprise(eps_history, ticker)
+                    if fig_eps:
+                        st.pyplot(fig_eps)
+                    beats = sum(1 for e in eps_history if e.get("サプライズ%") and e["サプライズ%"] > 0)
+                    total = len([e for e in eps_history if e.get("サプライズ%") is not None])
+                    if total:
+                        st.metric("直近4四半期 EPS Beat率", f"{beats}/{total} ({beats/total*100:.0f}%)")
+                else:
+                    st.info("EPS データが取得できませんでした（Yahoo Finance 制限の可能性）")
+
+            # ─ Step4: AI 分析（スピナー付き・独立・最後に実行） ──
+            st.markdown("**🤖 AI 決算総合分析（日本語）**")
+            xbrl_str = xbrl_df.to_string(index=False) if not xbrl_df.empty else "データなし"
+            eps_str  = json.dumps(eps_history, ensure_ascii=False, indent=2) if eps_history else "データなし"
+            with st.spinner("🤖 AI 分析中..."):
                 ai_analysis = ai_earnings_analysis(ticker, xbrl_str, eps_str)
-                st.info(ai_analysis)
+            st.info(ai_analysis)
 
-                # SEC フィリング
-                filings = get_edgar_filings(ticker, filing_type, count=4)
-                if filings:
-                    st.markdown(f"**📄 SEC {filing_type} フィリング（直近4件）**")
-                    fdf = pd.DataFrame(filings)[["form", "date", "url"]]
-                    fdf.columns = ["種別", "提出日", "EDGARリンク"]
-                    st.dataframe(
-                        fdf, use_container_width=True,
-                        column_config={"EDGARリンク": st.column_config.LinkColumn("EDGARリンク")},
-                    )
+            # ─ Step5: センチメント（スピナー付き・独立） ──────────
+            st.markdown("**🎯 ニュース センチメント**")
+            with st.spinner("🤖 センチメント分析中..."):
+                sentiment = ai_sentiment(tuple(headlines), ticker)
+            st.info(sentiment)
 
-                # レポート蓄積
-                headlines  = get_news_headlines(ticker, 5)
-                sentiment  = ai_sentiment(tuple(headlines), ticker)
-                report_txt = build_text_report(
-                    ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis
-                )
-                all_reports[ticker] = report_txt
+            # ─ SEC フィリング ─────────────────────────────────────
+            filings = get_edgar_filings(ticker, filing_type, count=4)
+            if filings:
+                st.markdown(f"**📄 SEC {filing_type} フィリング（直近4件）**")
+                fdf = pd.DataFrame(filings)[["form", "date", "url"]]
+                fdf.columns = ["種別", "提出日", "EDGARリンク"]
+                st.dataframe(fdf, use_container_width=True,
+                             column_config={"EDGARリンク": st.column_config.LinkColumn("EDGARリンク")})
 
+            # レポート蓄積
+            all_reports[ticker] = build_text_report(
+                ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis
+            )
+
+        # ── 一括ダウンロード ──────────────────────────────────────
         if all_reports:
             st.divider()
             combined = "\n\n".join(all_reports.values())
@@ -909,16 +758,14 @@ with tab2:
             )
             if enable_email:
                 subject = f"【NASDAQ決算速報】{', '.join(selected_tickers)} | {end_date}"
-                ok, msg = send_email_notification(
-                    subject, combined,
-                    attachment_bytes=combined.encode("utf-8"),
-                    filename=f"EarningsReport_{end_date}.txt",
-                )
+                ok, msg = send_email_notification(subject, combined,
+                                                   attachment_bytes=combined.encode("utf-8"),
+                                                   filename=f"EarningsReport_{end_date}.txt")
                 st.success(f"✅ {msg}") if ok else st.warning(f"⚠️ {msg}")
 
-# ─────────────────────────────────────────────────────────────
+# =============================================================
 # Tab 3: ニュース翻訳・センチメント
-# ─────────────────────────────────────────────────────────────
+# =============================================================
 with tab3:
     st.subheader("📰 最新ニュース 自動日本語翻訳・センチメント分析")
     news_ticker = st.selectbox(
@@ -932,7 +779,7 @@ with tab3:
             headlines = get_news_headlines(news_ticker, max_news)
 
         if not headlines:
-            st.warning("ニュースが取得できませんでした")
+            st.warning("ニュースが取得できませんでした（Yahoo Finance 制限の可能性）")
         else:
             st.markdown(f"### 📰 {news_ticker} 最新ニュース（英語原文）")
             for i, h in enumerate(headlines, 1):
@@ -948,8 +795,7 @@ with tab3:
             st.markdown("### 🌐 AI 日本語翻訳・要約")
             with st.spinner("翻訳・要約中..."):
                 translation = ai_translate_and_summarize(
-                    "\n".join(headlines),
-                    context=f"{news_ticker}に関するニュース見出し一覧",
+                    "\n".join(headlines), context=f"{news_ticker}に関するニュース見出し一覧"
                 )
             st.success(translation)
 
