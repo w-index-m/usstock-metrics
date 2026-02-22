@@ -159,17 +159,20 @@ def analyze_ticker(ticker, market_returns, api_key, start, end):
 @st.cache_data(ttl=3600)
 def get_cik(ticker: str) -> str | None:
     """ティッカー → CIK（10桁ゼロ埋め）"""
-    url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=10-K"
+    url = "https://www.sec.gov/files/company_tickers.json"
     try:
         r = requests.get(
-            f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=&CIK={ticker}&type=10-K&dateb=&owner=include&count=1&search_text=&output=atom",
+            url,
             headers={"User-Agent": "NasdaqDashboard/2.0 research@example.com"},
             timeout=15,
         )
-        # atom XML からCIK抽出
-        match = re.search(r"/cgi-bin/browse-edgar\?action=getcompany&CIK=(\d+)", r.text)
-        if match:
-            return match.group(1).zfill(10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        ticker_upper = ticker.upper()
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == ticker_upper:
+                return str(entry["cik_str"]).zfill(10)
     except Exception:
         pass
     return None
@@ -362,7 +365,7 @@ def gemini_translate_and_summarize(text: str, context: str = "") -> str:
 （ここに日本語で記載）
 """
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -385,7 +388,7 @@ def gemini_sentiment(headlines: list[str], ticker: str) -> str:
 理由: （日本語で説明）
 """
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -412,7 +415,7 @@ def gemini_earnings_analysis(ticker: str, xbrl_df: pd.DataFrame, eps_data: list[
 3. 投資判断上の注目点
 """
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -427,7 +430,7 @@ def gemini_company_summary(ticker: str) -> str:
 を投資家向けに日本語300文字以内で要約してください。
 """
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
