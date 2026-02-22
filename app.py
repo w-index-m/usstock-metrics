@@ -2,7 +2,7 @@
 """
 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード
 ─────────────────────────────────────────────────────
-追加機能（v2.0）
+追加機能（v2.1）
   ① SEC EDGAR から 10-Q / 10-K 取得 & XBRL 財務数値抽出
   ② 決算発表日・概要を Yahoo Finance から取得
   ③ 英文ニュース/決算サマリーを自動日本語翻訳（Gemini）
@@ -11,6 +11,10 @@ NASDAQ-100 プロ仕様 銘柄分析ダッシュボード
   ⑥ センチメント分析（ニュース見出し）
   ⑦ テキスト保存 & メール通知（SMTP）
   ⑧ 複数銘柄一括処理
+─────────────────────────────────────────────────────
+修正履歴（v2.1）
+  - Geminiモデルを gemini-1.5-flash → gemini-2.0-flash に更新
+  - CIK取得を SEC company_tickers.json 方式に変更（正規表現廃止）
 ─────────────────────────────────────────────────────
 必要 Secrets (Streamlit Secrets):
   TIINGO_API_KEY    : Tiingo API
@@ -96,17 +100,16 @@ nasdaq100_tickers = sorted(set([
     "DXCM","TEAM","FAST","BIIB","CHTR","EA","EXC","FANG","GEHC","GFS",
     "IDXX","KHC","LCID","LULU","MCHP","MDLZ","MRNA","PCAR","PDD","PYPL",
     "RIVN","SIRI","TTD","WBD","XEL","ZS","ANSS","AZN","BKR","CDW",
-    "CPRT","DLTR","EBAY","ENPH","ILMN","JD","KHC","MAR","MSTR","OKTA",
-    "ON","SPLK","TTWO","UAL","WBA","ZM","APP","ARM","SMCI","PLTR"
-    "ADI","NXPI","FTNT","WDAY","SNPS","MELI","CRWD","CTAS","VRT","CEG",
-    "ANET","SMCI","PLTR","APH","GLW",
+    "CPRT","DLTR","EBAY","ENPH","ILMN","JD","MAR","MSTR","OKTA",
+    "ON","SPLK","TTWO","UAL","WBA","ZM","APP","ARM","SMCI","PLTR",
+    "ANET","APH","GLW",
 ]))
 
 # ===============================
 # SEC EDGAR ヘッダー（User-Agent 必須）
 # ===============================
 EDGAR_HEADERS = {
-    "User-Agent": "NasdaqDashboard/2.0 research@example.com",
+    "User-Agent": "NasdaqDashboard/2.1 research@example.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "data.sec.gov",
 }
@@ -148,22 +151,32 @@ def analyze_ticker(ticker, market_returns, api_key, start, end):
         alpha   = annual_return - (0.01 + beta * (np.mean(y) * 252 - 0.01))
         sharpe  = (annual_return - 0.01) / annual_risk
         residual = np.std(x - beta * y) * np.sqrt(252)
-        return {"銘柄": ticker, "年間リターン": annual_return, "年間リスク": annual_risk,
-                "シャープレシオ": sharpe, "ベータ": beta, "アルファ": alpha, "レジデュアルリスク": residual}
+        return {
+            "銘柄": ticker,
+            "年間リターン": annual_return,
+            "年間リスク": annual_risk,
+            "シャープレシオ": sharpe,
+            "ベータ": beta,
+            "アルファ": alpha,
+            "レジデュアルリスク": residual,
+        }
     except Exception:
         return None
 
 # ===============================
-# ② SEC EDGAR : CIK 取得
+# ② SEC EDGAR : CIK 取得（修正版）
+#    SEC公式 company_tickers.json を使用
 # ===============================
 @st.cache_data(ttl=3600)
 def get_cik(ticker: str) -> str | None:
-    """ティッカー → CIK（10桁ゼロ埋め）"""
+    """ティッカー → CIK（10桁ゼロ埋め）
+    SEC EDGAR の company_tickers.json を使用（正規表現不要・確実）
+    """
     url = "https://www.sec.gov/files/company_tickers.json"
     try:
         r = requests.get(
             url,
-            headers={"User-Agent": "NasdaqDashboard/2.0 research@example.com"},
+            headers={"User-Agent": "NasdaqDashboard/2.1 research@example.com"},
             timeout=15,
         )
         if r.status_code != 200:
@@ -192,9 +205,9 @@ def get_edgar_filings(ticker: str, form_type: str = "10-K", count: int = 4) -> l
         if r.status_code != 200:
             return []
         data = r.json()
-        filings = data.get("filings", {}).get("recent", {})
-        forms   = filings.get("form", [])
-        dates   = filings.get("filingDate", [])
+        filings    = data.get("filings", {}).get("recent", {})
+        forms      = filings.get("form", [])
+        dates      = filings.get("filingDate", [])
         accessions = filings.get("accessionNumber", [])
         results = []
         for i, f in enumerate(forms):
@@ -231,17 +244,20 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
             return pd.DataFrame()
         facts = r.json().get("facts", {})
 
-        def extract_series(concept_path: str, label: str) -> pd.Series:
-            """us-gaap:概念名 → 四半期値 Series"""
+        def extract_series(concept_path: str, label: str) -> pd.DataFrame:
+            """us-gaap:概念名 → 四半期値 DataFrame"""
             ns, concept = concept_path.split(":")
             units = facts.get(ns, {}).get(concept, {}).get("units", {})
-            # 通貨単位（USD）または純粋数値（shares）
+            entries = []
             for unit_key in ["USD", "USD/shares", "shares"]:
                 entries = units.get(unit_key, [])
                 if entries:
                     break
-            # 四半期（form=10-Q or 10-K）のみ、直近8件
-            q_entries = [e for e in entries if e.get("form") in ("10-Q", "10-K") and e.get("fp")]
+            # 四半期（form=10-Q or 10-K）のみ、直近5件
+            q_entries = [
+                e for e in entries
+                if e.get("form") in ("10-Q", "10-K") and e.get("fp")
+            ]
             q_entries.sort(key=lambda x: x.get("end", ""), reverse=True)
             rows = []
             seen = set()
@@ -255,10 +271,15 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
                     break
             return pd.DataFrame(rows).set_index("期間末") if rows else pd.DataFrame()
 
-        # 主要指標
-        revenue_df = extract_series("us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "売上高")
+        # 主要指標（複数のコンセプト名に対応）
+        revenue_df = extract_series(
+            "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "売上高"
+        )
         if revenue_df.empty:
             revenue_df = extract_series("us-gaap:Revenues", "売上高")
+        if revenue_df.empty:
+            revenue_df = extract_series("us-gaap:SalesRevenueNet", "売上高")
+
         net_income_df = extract_series("us-gaap:NetIncomeLoss", "純利益")
         eps_df        = extract_series("us-gaap:EarningsPerShareBasic", "EPS（基本）")
 
@@ -268,7 +289,11 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
         merged = dfs[0]
         for d in dfs[1:]:
             merged = merged.join(d, how="outer")
-        merged = merged.sort_index(ascending=False).head(5).reset_index()
+        merged = (
+            merged.sort_index(ascending=False)
+            .head(5)
+            .reset_index()
+        )
         merged["銘柄"] = ticker
         return merged
     except Exception:
@@ -284,10 +309,13 @@ def get_earnings_data(ticker: str) -> dict:
     決算発表日、EPS実績、EPS予想を取得
     """
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json",
     }
-    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents,earningsHistory,defaultKeyStatistics"
+    url = (
+        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+        "?modules=calendarEvents,earningsHistory,defaultKeyStatistics"
+    )
     try:
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
@@ -296,11 +324,15 @@ def get_earnings_data(ticker: str) -> dict:
 
         # 次回決算日
         earnings_dates = (
-            data.get("calendarEvents", {}).get("earnings", {}).get("earningsDate", [])
+            data.get("calendarEvents", {})
+            .get("earnings", {})
+            .get("earningsDate", [])
         )
-        next_date = earnings_dates[0].get("fmt", "N/A") if earnings_dates else "N/A"
+        next_date = (
+            earnings_dates[0].get("fmt", "N/A") if earnings_dates else "N/A"
+        )
 
-        # 過去EPS
+        # 過去EPS履歴
         history = data.get("earningsHistory", {}).get("history", [])
         eps_history = []
         for h in history[-4:]:
@@ -311,7 +343,7 @@ def get_earnings_data(ticker: str) -> dict:
                 "サプライズ%": h.get("surprisePercent", {}).get("raw"),
             })
 
-        # 統計
+        # バリュエーション統計
         stats = data.get("defaultKeyStatistics", {})
         return {
             "次回決算日": next_date,
@@ -328,13 +360,15 @@ def get_earnings_data(ticker: str) -> dict:
 @st.cache_data(ttl=900)
 def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
     """Yahoo Finance RSS から最新ニュース見出しを取得"""
-    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+    url = (
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline"
+        f"?s={ticker}&region=US&lang=en-US"
+    )
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             return []
         root = ET.fromstring(r.content)
-        ns = {"media": "http://search.yahoo.com/mrss/"}
         titles = []
         for item in root.findall(".//item"):
             title_el = item.find("title")
@@ -348,7 +382,11 @@ def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
 
 # ===============================
 # ⑦ Gemini : 翻訳 & サマリー & センチメント
+#    ※ モデルを gemini-2.0-flash に更新（v2.1修正）
 # ===============================
+GEMINI_MODEL = "gemini-2.0-flash"
+
+
 def gemini_translate_and_summarize(text: str, context: str = "") -> str:
     """英文テキストを日本語に翻訳し要約する"""
     if not GEMINI_API_KEY:
@@ -365,7 +403,7 @@ def gemini_translate_and_summarize(text: str, context: str = "") -> str:
 （ここに日本語で記載）
 """
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -388,18 +426,20 @@ def gemini_sentiment(headlines: list[str], ticker: str) -> str:
 理由: （日本語で説明）
 """
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
 
 
-def gemini_earnings_analysis(ticker: str, xbrl_df: pd.DataFrame, eps_data: list[dict]) -> str:
+def gemini_earnings_analysis(
+    ticker: str, xbrl_df: pd.DataFrame, eps_data: list[dict]
+) -> str:
     """決算データを総合分析して日本語レポートを生成"""
     if not GEMINI_API_KEY:
         return "（Gemini API Key 未設定）"
     xbrl_str = xbrl_df.to_string(index=False) if not xbrl_df.empty else "データなし"
-    eps_str = json.dumps(eps_data, ensure_ascii=False, indent=2) if eps_data else "データなし"
+    eps_str  = json.dumps(eps_data, ensure_ascii=False, indent=2) if eps_data else "データなし"
     prompt = f"""
 米国株「{ticker}」の決算データを分析し、投資家向けの日本語レポートを作成してください。
 
@@ -415,13 +455,14 @@ def gemini_earnings_analysis(ticker: str, xbrl_df: pd.DataFrame, eps_data: list[
 3. 投資判断上の注目点
 """
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
 
 
 def gemini_company_summary(ticker: str) -> str:
+    """企業概要を日本語で生成"""
     if not GEMINI_API_KEY:
         return "（Gemini API Key 未設定）"
     prompt = f"""
@@ -430,7 +471,7 @@ def gemini_company_summary(ticker: str) -> str:
 を投資家向けに日本語300文字以内で要約してください。
 """
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         return model.generate_content(prompt).text
     except Exception as e:
         return f"Gemini Error: {e}"
@@ -438,7 +479,12 @@ def gemini_company_summary(ticker: str) -> str:
 # ===============================
 # ⑧ メール通知
 # ===============================
-def send_email_notification(subject: str, body: str, attachment_bytes: bytes | None = None, filename: str = "report.xlsx"):
+def send_email_notification(
+    subject: str,
+    body: str,
+    attachment_bytes: bytes | None = None,
+    filename: str = "report.txt",
+):
     """決算速報をメールで通知する"""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASS, NOTIFY_EMAIL]):
         return False, "SMTP設定が不完全です（Secretsを確認）"
@@ -463,21 +509,30 @@ def send_email_notification(subject: str, body: str, attachment_bytes: bytes | N
         return False, f"メール送信失敗: {e}"
 
 # ===============================
-# ⑨ テキストレポート保存
+# ⑨ テキストレポート生成
 # ===============================
-def build_text_report(ticker: str, earnings_info: dict, xbrl_df: pd.DataFrame,
-                      headlines: list[str], sentiment: str, ai_analysis: str) -> str:
+def build_text_report(
+    ticker: str,
+    earnings_info: dict,
+    xbrl_df: pd.DataFrame,
+    headlines: list[str],
+    sentiment: str,
+    ai_analysis: str,
+) -> str:
     lines = [
-        f"=" * 60,
+        "=" * 60,
         f"  {ticker} 決算レポート（生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M')}）",
-        f"=" * 60,
+        "=" * 60,
         f"\n【次回決算日】 {earnings_info.get('次回決算日', 'N/A')}",
         f"【PER(予想)】  {earnings_info.get('PER(予想)', 'N/A')}",
         f"【PBR】       {earnings_info.get('PBR', 'N/A')}",
         "\n【EPS履歴・サプライズ】",
     ]
     for e in earnings_info.get("EPS履歴", []):
-        lines.append(f"  {e['期間']} | 実績: {e['EPS実績']} | 予想: {e['EPS予想']} | サプライズ: {e.get('サプライズ%', 'N/A')}%")
+        lines.append(
+            f"  {e['期間']} | 実績: {e['EPS実績']} | 予想: {e['EPS予想']}"
+            f" | サプライズ: {e.get('サプライズ%', 'N/A')}%"
+        )
 
     if not xbrl_df.empty:
         lines.append("\n【XBRL財務データ（SEC EDGAR）】")
@@ -506,10 +561,17 @@ def plot_xbrl_quarterly(xbrl_df: pd.DataFrame, ticker: str):
         axes = [axes]
     for ax, col in zip(axes, cols):
         vals = xbrl_df[col].dropna()
-        periods = xbrl_df.loc[vals.index, "期間末"] if "期間末" in xbrl_df.columns else range(len(vals))
-        ax.bar(range(len(vals)), vals / 1e9, color="#4472C4")
+        if vals.empty:
+            continue
+        idx = vals.index.tolist()
+        periods = (
+            xbrl_df.loc[idx, "期間末"].tolist()
+            if "期間末" in xbrl_df.columns
+            else list(range(len(vals)))
+        )
+        ax.bar(range(len(vals)), vals.values / 1e9, color="#4472C4")
         ax.set_xticks(range(len(vals)))
-        ax.set_xticklabels(list(periods), rotation=30, ha="right", fontsize=8)
+        ax.set_xticklabels(periods, rotation=30, ha="right", fontsize=8)
         ax.set_title(f"{ticker} {col}（十億USD）")
         ax.set_ylabel("十億USD")
     plt.tight_layout()
@@ -536,10 +598,14 @@ def plot_eps_surprise(eps_history: list[dict], ticker: str):
 # ===============================
 # UI
 # ===============================
-st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード")
+st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.1")
 
 # タブ構成
-tab1, tab2, tab3 = st.tabs(["📊 パフォーマンス分析", "📋 決算分析（EDGAR・EPS）", "📰 ニュース翻訳・センチメント"])
+tab1, tab2, tab3 = st.tabs([
+    "📊 パフォーマンス分析",
+    "📋 決算分析（EDGAR・EPS）",
+    "📰 ニュース翻訳・センチメント",
+])
 
 # ─── サイドバー ───────────────────────────────────────────────
 with st.sidebar:
@@ -558,13 +624,13 @@ with st.sidebar:
     st.subheader("📧 メール通知")
     enable_email = st.checkbox("決算レポートをメールで通知", value=False)
     st.divider()
-    st.caption("v2.0 | SEC EDGAR / Yahoo Finance / Gemini AI")
+    st.caption("v2.1 | SEC EDGAR / Yahoo Finance / Gemini gemini-2.0-flash")
 
 end_date   = datetime.today().date()
 start_date = end_date - timedelta(days=years * 365)
 
 # ─────────────────────────────────────────────────────────────
-# Tab 1: パフォーマンス分析（既存機能）
+# Tab 1: パフォーマンス分析
 # ─────────────────────────────────────────────────────────────
 with tab1:
     st.subheader("📊 NASDAQ-100 パフォーマンス分析")
@@ -576,8 +642,13 @@ with tab1:
             else:
                 results = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = [executor.submit(analyze_ticker, t, market_returns, TIINGO_API_KEY, start_date, end_date)
-                               for t in nasdaq100_tickers]
+                    futures = [
+                        executor.submit(
+                            analyze_ticker, t, market_returns,
+                            TIINGO_API_KEY, start_date, end_date
+                        )
+                        for t in nasdaq100_tickers
+                    ]
                     for f in futures:
                         r = f.result()
                         if r:
@@ -587,11 +658,16 @@ with tab1:
                 if df.empty:
                     st.error("有効な分析結果がありません")
                 else:
-                    # 順位列を追加（値上がり順位・シャープレシオ順位）
-                    df.insert(0, "シャープレシオ順位", df["シャープレシオ"].rank(ascending=False, method="min").astype(int))
-                    df.insert(0, "値上がり順位", df["年間リターン"].rank(ascending=False, method="min").astype(int))
-                    # デフォルト表示は値上がり順位でソート
+                    df.insert(
+                        0, "シャープレシオ順位",
+                        df["シャープレシオ"].rank(ascending=False, method="min").astype(int),
+                    )
+                    df.insert(
+                        0, "値上がり順位",
+                        df["年間リターン"].rank(ascending=False, method="min").astype(int),
+                    )
                     df = df.sort_values("値上がり順位").reset_index(drop=True)
+
                     st.dataframe(
                         df.style
                         .format("{:.2%}", subset=["年間リターン", "年間リスク", "アルファ", "レジデュアルリスク"])
@@ -604,7 +680,8 @@ with tab1:
                     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
                     ax1.bar(top["銘柄"], top["年間リターン"] * 100, label="リターン(%)", color="#4472C4")
                     ax1.bar(top["銘柄"], top["年間リスク"] * 100, alpha=0.3, label="リスク(%)", color="#ED7D31")
-                    ax1.legend(); ax1.set_title("年間リターン / リスク（上位20銘柄）")
+                    ax1.legend()
+                    ax1.set_title("年間リターン / リスク（上位20銘柄）")
                     ax2.bar(top["銘柄"], top["シャープレシオ"], color="#70AD47")
                     ax2.set_title("シャープレシオ（上位20銘柄）")
                     plt.tight_layout()
@@ -618,8 +695,11 @@ with tab1:
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
                         df.to_excel(writer, index=False, sheet_name="Analysis")
-                    st.download_button("📥 Excelでダウンロード", data=output.getvalue(),
-                                       file_name=f"Nasdaq100_Analysis_{end_date}.xlsx")
+                    st.download_button(
+                        "📥 Excelでダウンロード",
+                        data=output.getvalue(),
+                        file_name=f"Nasdaq100_Analysis_{end_date}.xlsx",
+                    )
 
 # ─────────────────────────────────────────────────────────────
 # Tab 2: 決算分析
@@ -629,7 +709,7 @@ with tab2:
     if not selected_tickers:
         st.info("サイドバーで銘柄を選択してください")
     elif st.button("▶ 決算データを取得・分析", type="primary"):
-        all_reports = {}
+        all_reports: dict[str, str] = {}
 
         for ticker in selected_tickers:
             st.markdown(f"---\n### 🔍 {ticker}")
@@ -641,12 +721,13 @@ with tab2:
                 with cols[0]:
                     st.markdown("**📈 XBRL 財務データ（SEC EDGAR）**")
                     if not xbrl_df.empty:
-                        # 表示用に単位変換（Bドル）
                         disp_df = xbrl_df.copy()
                         for c in ["売上高", "純利益"]:
                             if c in disp_df.columns:
                                 disp_df[c] = disp_df[c].apply(
-                                    lambda v: f"${v/1e9:.2f}B" if pd.notna(v) and v != 0 else "N/A"
+                                    lambda v: f"${v/1e9:.2f}B"
+                                    if pd.notna(v) and v != 0
+                                    else "N/A"
                                 )
                         if "EPS（基本）" in disp_df.columns:
                             disp_df["EPS（基本）"] = disp_df["EPS（基本）"].apply(
@@ -664,22 +745,35 @@ with tab2:
                 with cols[1]:
                     st.markdown("**📅 決算発表日・EPS サプライズ**")
                     st.markdown(f"- **次回決算日**: {earnings_info.get('次回決算日', 'N/A')}")
-                    st.markdown(f"- **予想PER**: {earnings_info.get('PER(予想)', 'N/A')}")
-                    st.markdown(f"- **PBR**: {earnings_info.get('PBR', 'N/A')}")
+                    per_val = earnings_info.get("PER(予想)")
+                    pbr_val = earnings_info.get("PBR")
+                    st.markdown(
+                        f"- **予想PER**: {f'{per_val:.1f}' if per_val else 'N/A'}"
+                    )
+                    st.markdown(
+                        f"- **PBR**: {f'{pbr_val:.2f}' if pbr_val else 'N/A'}"
+                    )
 
                     eps_history = earnings_info.get("EPS履歴", [])
                     if eps_history:
-                        eps_df = pd.DataFrame(eps_history)
-                        st.dataframe(eps_df, use_container_width=True)
+                        eps_df_disp = pd.DataFrame(eps_history)
+                        st.dataframe(eps_df_disp, use_container_width=True)
                         fig_eps = plot_eps_surprise(eps_history, ticker)
                         if fig_eps:
                             st.pyplot(fig_eps)
 
-                        # コンセンサス比較サマリー
-                        beats = sum(1 for e in eps_history if e.get("サプライズ%") and e["サプライズ%"] > 0)
-                        total = len([e for e in eps_history if e.get("サプライズ%") is not None])
+                        beats = sum(
+                            1 for e in eps_history
+                            if e.get("サプライズ%") and e["サプライズ%"] > 0
+                        )
+                        total = len(
+                            [e for e in eps_history if e.get("サプライズ%") is not None]
+                        )
                         if total:
-                            st.metric("直近4四半期 EPS Beat率", f"{beats}/{total} ({beats/total*100:.0f}%)")
+                            st.metric(
+                                "直近4四半期 EPS Beat率",
+                                f"{beats}/{total} ({beats/total*100:.0f}%)",
+                            )
 
                 # ── AI 決算分析 ──
                 st.markdown("**🤖 AI 決算総合分析（日本語）**")
@@ -692,17 +786,23 @@ with tab2:
                     st.markdown(f"**📄 SEC {filing_type} フィリング（直近4件）**")
                     fdf = pd.DataFrame(filings)[["form", "date", "url"]]
                     fdf.columns = ["種別", "提出日", "EDGARリンク"]
-                    st.dataframe(fdf, use_container_width=True, column_config={
-                        "EDGARリンク": st.column_config.LinkColumn("EDGARリンク")
-                    })
+                    st.dataframe(
+                        fdf,
+                        use_container_width=True,
+                        column_config={
+                            "EDGARリンク": st.column_config.LinkColumn("EDGARリンク")
+                        },
+                    )
 
                 # ── レポートテキスト蓄積 ──
-                headlines = get_news_headlines(ticker, 5)
-                sentiment = gemini_sentiment(headlines, ticker)
-                report_txt = build_text_report(ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis)
+                headlines   = get_news_headlines(ticker, 5)
+                sentiment   = gemini_sentiment(headlines, ticker)
+                report_txt  = build_text_report(
+                    ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis
+                )
                 all_reports[ticker] = report_txt
 
-        # ── 一括ダウンロード（テキスト）──
+        # ── 一括ダウンロード ──
         if all_reports:
             st.divider()
             combined = "\n\n".join(all_reports.values())
@@ -717,7 +817,8 @@ with tab2:
             if enable_email:
                 subject = f"【NASDAQ決算速報】{', '.join(selected_tickers)} | {end_date}"
                 ok, msg = send_email_notification(
-                    subject, combined,
+                    subject,
+                    combined,
                     attachment_bytes=combined.encode("utf-8"),
                     filename=f"EarningsReport_{end_date}.txt",
                 )
@@ -731,7 +832,11 @@ with tab2:
 # ─────────────────────────────────────────────────────────────
 with tab3:
     st.subheader("📰 最新ニュース 自動日本語翻訳・センチメント分析")
-    news_ticker = st.selectbox("銘柄を選択", nasdaq100_tickers, index=nasdaq100_tickers.index("AAPL"))
+    news_ticker = st.selectbox(
+        "銘柄を選択",
+        nasdaq100_tickers,
+        index=nasdaq100_tickers.index("AAPL") if "AAPL" in nasdaq100_tickers else 0,
+    )
     max_news = st.slider("取得ニュース件数", 3, 20, 8)
 
     if st.button("▶ ニュースを取得・翻訳", type="primary"):
@@ -745,26 +850,24 @@ with tab3:
             for i, h in enumerate(headlines, 1):
                 st.markdown(f"{i}. {h}")
 
-            # センチメント
             st.markdown("---")
             st.markdown("### 🎯 センチメント分析（AI）")
             with st.spinner("センチメント分析中..."):
                 sentiment_result = gemini_sentiment(headlines, news_ticker)
             st.info(sentiment_result)
 
-            # 一括翻訳
             st.markdown("---")
             st.markdown("### 🌐 AI 日本語翻訳・要約")
             all_headlines_text = "\n".join(headlines)
             with st.spinner("翻訳・要約中..."):
                 translation = gemini_translate_and_summarize(
                     all_headlines_text,
-                    context=f"{news_ticker}に関するニュース見出し一覧"
+                    context=f"{news_ticker}に関するニュース見出し一覧",
                 )
             st.success(translation)
 
-            # テキスト保存
-            report_news = f"# {news_ticker} ニュースレポート ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
+            # ダウンロード用レポート
+            report_news  = f"# {news_ticker} ニュースレポート ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
             report_news += "## 英語原文\n" + "\n".join(f"- {h}" for h in headlines)
             report_news += f"\n\n## センチメント分析\n{sentiment_result}"
             report_news += f"\n\n## 日本語翻訳・要約\n{translation}"
