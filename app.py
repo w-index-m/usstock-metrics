@@ -92,6 +92,13 @@ nasdaq100_tickers = sorted(set([
     "ADBE","NFLX","AMD","INTC","CSCO","QCOM","TXN","AMAT","HON","INTU",
     "SBUX","BKNG","ADP","REGN","VRTX","LRCX","MU","PANW","KLAC","CDNS",
     "ADI","NXPI","FTNT","WDAY","SNPS","MELI","CRWD","CTAS","VRT","CEG",
+    "MRVL","ORLY","MNST","ASML","CSX","ROST","PAYX","AEP","KDP","ODFL",
+    "DXCM","TEAM","FAST","BIIB","CHTR","EA","EXC","FANG","GEHC","GFS",
+    "IDXX","KHC","LCID","LULU","MCHP","MDLZ","MRNA","PCAR","PDD","PYPL",
+    "RIVN","SIRI","TTD","WBD","XEL","ZS","ANSS","AZN","BKR","CDW",
+    "CPRT","DLTR","EBAY","ENPH","ILMN","JD","KHC","MAR","MSTR","OKTA",
+    "ON","SPLK","TTWO","UAL","WBA","ZM","APP","ARM","SMCI","PLTR"
+    "ADI","NXPI","FTNT","WDAY","SNPS","MELI","CRWD","CTAS","VRT","CEG",
     "ANET","SMCI","PLTR","APH","GLW",
 ]))
 
