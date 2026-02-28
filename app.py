@@ -231,7 +231,7 @@ nasdaq100_tickers = sorted(set([
     "RIVN","SIRI","TTD","WBD","XEL","ZS","ANSS","AZN","BKR","CDW",
     "CPRT","DLTR","EBAY","ENPH","ILMN","JD","MAR","MSTR","OKTA",
     "ON","SPLK","TTWO","UAL","WBA","ZM","APP","ARM","SMCI","PLTR",
-    "ANET","APH","GLW","COHR","AAOI","LITE","IQE ",
+    "ANET","APH","GLW",
 ]))
 
 EDGAR_HEADERS = {
@@ -749,10 +749,17 @@ with tab1:
                     source_info = " | ".join([f"{k}: {v}銘柄" for k, v in source_counts.items()])
                     st.info(f"📡 使用データソース内訳: {source_info}")
 
-                # 表示時はデータソース列を末尾に移動
-                display_cols = [c for c in df.columns if c != "データソース"] + (
-                    ["データソース"] if "データソース" in df.columns else []
+                # 銘柄コード → Yahoo Finance URL 列を追加
+                df["Yahoo Finance"] = df["銘柄"].apply(
+                    lambda t: f"https://finance.yahoo.com/quote/{t}/"
                 )
+
+                # 表示列順: データソースを末尾、Yahoo Financeを銘柄の直後
+                base_cols = ["値上がり順位", "シャープレシオ順位", "銘柄", "Yahoo Finance",
+                             "年間リターン", "年間リスク", "シャープレシオ", "ベータ", "アルファ", "レジデュアルリスク"]
+                display_cols = [c for c in base_cols if c in df.columns]
+                if "データソース" in df.columns:
+                    display_cols.append("データソース")
 
                 st.dataframe(
                     df[display_cols].style
@@ -760,6 +767,12 @@ with tab1:
                     .format("{:.2f}", subset=["シャープレシオ", "ベータ"])
                     .format("{:d}",   subset=["値上がり順位", "シャープレシオ順位"]),
                     use_container_width=True,
+                    column_config={
+                        "Yahoo Finance": st.column_config.LinkColumn(
+                            "Yahoo Finance",
+                            display_text="📈 表示",   # セルに表示するラベル
+                        ),
+                    },
                 )
 
                 top = df.sort_values("シャープレシオ", ascending=False).head(20)
