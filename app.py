@@ -231,7 +231,7 @@ nasdaq100_tickers = sorted(set([
     "RIVN","SIRI","TTD","WBD","XEL","ZS","ANSS","AZN","BKR","CDW",
     "CPRT","DLTR","EBAY","ENPH","ILMN","JD","MAR","MSTR","OKTA",
     "ON","SPLK","TTWO","UAL","WBA","ZM","APP","ARM","SMCI","PLTR",
-    "ANET","APH","GLW","COHR","AAOI","LITE",
+    "ANET","APH","GLW","COHR","AAOI","LITE","IQE ",
 ]))
 
 EDGAR_HEADERS = {
