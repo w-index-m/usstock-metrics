@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.4
+NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.5
 ─────────────────────────────────────────────────────
-修正履歴（v2.4）
-  - Yahoo Finance タイムアウト短縮（5秒）+ ハング防止
-  - AI分析をスピナー外に出してノンブロッキング化
-  - 各データ取得ステップを独立 try/except でフェイルセーフ化
-  - ぐるぐる（無限スピナー）問題を解消
-  - AI プロバイダーフォールバック: Gemini → Groq → OpenRouter
+修正履歴（v2.5）
+  - パフォーマンス分析のデータソース フォールバック追加
+    Tiingo → Stooq → Yahoo Finance の順で自動切り替え
+  - get_market_data / analyze_ticker を共通ラッパーで統合
+  - 各プロバイダーで取得失敗時にトーストで通知
 ─────────────────────────────────────────────────────
 必要 Secrets:
   TIINGO_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY
@@ -61,8 +60,7 @@ SMTP_PASS          = st.secrets.get("SMTP_PASS", "")
 NOTIFY_EMAIL       = st.secrets.get("NOTIFY_EMAIL", "")
 
 if not TIINGO_API_KEY:
-    st.error("⚠️ TIINGO_API_KEY が未設定です")
-    st.stop()
+    st.warning("⚠️ TIINGO_API_KEY が未設定です。Stooq / Yahoo Finance にフォールバックします。")
 
 if GEMINI_API_KEY and GENAI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -237,32 +235,20 @@ nasdaq100_tickers = sorted(set([
 ]))
 
 EDGAR_HEADERS = {
-    "User-Agent": "NasdaqDashboard/2.4 research@example.com",
+    "User-Agent": "NasdaqDashboard/2.5 research@example.com",
     "Accept-Encoding": "gzip, deflate",
     "Host": "data.sec.gov",
 }
 
-# ── 株価・リターン ────────────────────────────────────────────
+# =============================================================
+# ── 株価データ取得 フォールバック付き ────────────────────────
+# 優先順位: Tiingo → Stooq → Yahoo Finance
+# =============================================================
 
-def get_market_data(api_key, start, end):
-    try:
-        r = requests.get(
-            "https://api.tiingo.com/tiingo/daily/QQQ/prices",
-            params={"startDate": str(start), "endDate": str(end),
-                    "resampleFreq": "daily", "token": api_key},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return None
-        df = pd.DataFrame(r.json())
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        return df["adjClose"].pct_change().dropna()
-    except Exception:
+def _prices_from_tiingo(ticker: str, start, end, api_key: str) -> pd.Series | None:
+    """Tiingo から日次 adjClose を取得して日次リターンで返す"""
+    if not api_key:
         return None
-
-
-def analyze_ticker(ticker, market_returns, api_key, start, end):
     try:
         r = requests.get(
             f"https://api.tiingo.com/tiingo/daily/{ticker}/prices",
@@ -273,24 +259,150 @@ def analyze_ticker(ticker, market_returns, api_key, start, end):
         if r.status_code != 200:
             return None
         df = pd.DataFrame(r.json())
+        if df.empty or "adjClose" not in df.columns:
+            return None
         df["date"] = pd.to_datetime(df["date"])
         df.set_index("date", inplace=True)
-        returns = df["adjClose"].pct_change().dropna()
-        common  = returns.index.intersection(market_returns.index)
-        if len(common) < 60:
-            return None
-        x = returns.loc[common].values
-        y = market_returns.loc[common].values
-        annual_return = np.mean(x) * 252
-        annual_risk   = np.std(x) * np.sqrt(252)
-        beta     = np.cov(x, y)[0, 1] / np.var(y)
-        alpha    = annual_return - (0.01 + beta * (np.mean(y) * 252 - 0.01))
-        sharpe   = (annual_return - 0.01) / annual_risk
-        residual = np.std(x - beta * y) * np.sqrt(252)
-        return {"銘柄": ticker, "年間リターン": annual_return, "年間リスク": annual_risk,
-                "シャープレシオ": sharpe, "ベータ": beta, "アルファ": alpha, "レジデュアルリスク": residual}
+        return df["adjClose"].pct_change().dropna()
     except Exception:
         return None
+
+
+def _prices_from_stooq(ticker: str, start, end) -> pd.Series | None:
+    """
+    Stooq CSV API から日次終値を取得してリターンで返す。
+    Stooq のシンボルは '.US' サフィックスを付ける（例: AAPL.US）。
+    QQQ は QQQ.US として取得可能。
+    """
+    try:
+        stooq_symbol = f"{ticker}.US"
+        url = (
+            f"https://stooq.com/q/d/l/?s={stooq_symbol}"
+            f"&d1={str(start).replace('-','')}&d2={str(end).replace('-','')}&i=d"
+        )
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        if df.empty or "Close" not in df.columns:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        return df["Close"].pct_change().dropna()
+    except Exception:
+        return None
+
+
+def _prices_from_yahoo(ticker: str, start, end) -> pd.Series | None:
+    """
+    Yahoo Finance v8 API から日次 adjclose を取得してリターンで返す。
+    レート制限に注意（並列呼び出し時は適宜スリープを）。
+    """
+    try:
+        start_ts = int(datetime.combine(start, datetime.min.time()).timestamp())
+        end_ts   = int(datetime.combine(end,   datetime.min.time()).timestamp())
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+            f"?interval=1d&period1={start_ts}&period2={end_ts}"
+        )
+        r = requests.get(
+            url, timeout=(5, 10),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        if r.status_code != 200:
+            return None
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return None
+        timestamps = result[0].get("timestamp", [])
+        adjclose   = result[0].get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
+        if not timestamps or not adjclose:
+            return None
+        dates = pd.to_datetime(timestamps, unit="s").normalize()
+        series = pd.Series(adjclose, index=dates, dtype=float).dropna()
+        return series.pct_change().dropna()
+    except Exception:
+        return None
+
+
+def _fetch_returns_with_fallback(
+    ticker: str, start, end, api_key: str, label: str = ""
+) -> tuple[pd.Series | None, str]:
+    """
+    Tiingo → Stooq → Yahoo Finance の順でリターン系列を取得。
+    成功したプロバイダー名も返す。
+    label は進捗表示用（例: "QQQ"）。
+    """
+    tag = label or ticker
+
+    # 1️⃣ Tiingo
+    if api_key:
+        result = _prices_from_tiingo(ticker, start, end, api_key)
+        if result is not None and len(result) > 10:
+            return result, "Tiingo"
+
+    # 2️⃣ Stooq
+    result = _prices_from_stooq(ticker, start, end)
+    if result is not None and len(result) > 10:
+        return result, "Stooq"
+
+    # 3️⃣ Yahoo Finance
+    result = _prices_from_yahoo(ticker, start, end)
+    if result is not None and len(result) > 10:
+        return result, "Yahoo Finance"
+
+    return None, "（全プロバイダー失敗）"
+
+
+# ── 市場ベンチマーク（QQQ）────────────────────────────────────
+
+def get_market_data(api_key, start, end):
+    """QQQ のリターン系列を取得。失敗時は None。"""
+    result, provider = _fetch_returns_with_fallback("QQQ", start, end, api_key, label="QQQ")
+    if result is None:
+        st.error("❌ QQQ（市場ベンチマーク）の取得に全プロバイダーで失敗しました")
+        return None
+    if provider != "Tiingo":
+        st.toast(f"📡 QQQ データ: {provider} を使用", icon="📡")
+    return result
+
+
+# ── 個別銘柄分析 ──────────────────────────────────────────────
+
+def analyze_ticker(ticker, market_returns, api_key, start, end):
+    """
+    個別銘柄のリターン系列を取得し、統計指標を計算して返す。
+    データ取得は Tiingo → Stooq → Yahoo Finance の順でフォールバック。
+    """
+    returns, provider = _fetch_returns_with_fallback(ticker, start, end, api_key, label=ticker)
+    if returns is None:
+        return None
+
+    common = returns.index.intersection(market_returns.index)
+    if len(common) < 60:
+        return None
+
+    x = returns.loc[common].values
+    y = market_returns.loc[common].values
+    annual_return = np.mean(x) * 252
+    annual_risk   = np.std(x) * np.sqrt(252)
+    beta     = np.cov(x, y)[0, 1] / np.var(y)
+    alpha    = annual_return - (0.01 + beta * (np.mean(y) * 252 - 0.01))
+    sharpe   = (annual_return - 0.01) / annual_risk
+    residual = np.std(x - beta * y) * np.sqrt(252)
+
+    return {
+        "銘柄": ticker,
+        "データソース": provider,          # どのプロバイダーで取得できたかを記録
+        "年間リターン": annual_return,
+        "年間リスク": annual_risk,
+        "シャープレシオ": sharpe,
+        "ベータ": beta,
+        "アルファ": alpha,
+        "レジデュアルリスク": residual,
+    }
+
 
 # ── CIK 取得 ──────────────────────────────────────────────────
 
@@ -299,7 +411,7 @@ def get_cik(ticker: str) -> str | None:
     try:
         r = requests.get(
             "https://www.sec.gov/files/company_tickers.json",
-            headers={"User-Agent": "NasdaqDashboard/2.4 research@example.com"},
+            headers={"User-Agent": "NasdaqDashboard/2.5 research@example.com"},
             timeout=10,
         )
         if r.status_code != 200:
@@ -395,14 +507,10 @@ def get_xbrl_financials(ticker: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# ── Yahoo Finance 決算データ（タイムアウト強化版）─────────────
+# ── Yahoo Finance 決算データ ──────────────────────────────────
 
 @st.cache_data(ttl=1800)
 def get_earnings_data(ticker: str) -> dict:
-    """
-    タイムアウト 5秒 + 失敗時は空dictを即返す。
-    ハング防止のため requests.Session + stream=False を使用。
-    """
     try:
         session = requests.Session()
         session.headers.update({
@@ -412,7 +520,7 @@ def get_earnings_data(ticker: str) -> dict:
         r = session.get(
             f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
             "?modules=calendarEvents,earningsHistory,defaultKeyStatistics",
-            timeout=(3, 5),   # (connect_timeout, read_timeout)
+            timeout=(3, 5),
             stream=False,
         )
         session.close()
@@ -442,7 +550,6 @@ def get_earnings_data(ticker: str) -> dict:
             "PBR":        stats.get("priceToBook", {}).get("raw"),
         }
     except Exception:
-        # タイムアウト・接続エラー時は即座に空dictで返す
         return {}
 
 # ── Yahoo Finance ニュース ────────────────────────────────────
@@ -556,7 +663,7 @@ def plot_eps_surprise(eps_history, ticker):
 # =============================================================
 # UI
 # =============================================================
-st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.4")
+st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.5")
 
 with st.expander("🤖 AI プロバイダー状態", expanded=False):
     c1, c2, c3 = st.columns(3)
@@ -582,8 +689,15 @@ with st.sidebar:
     st.divider()
     enable_email = st.checkbox("決算レポートをメールで通知", value=False)
     st.divider()
-    st.info("💡 AI フォールバック順\n1️⃣ Gemini\n2️⃣ Groq\n3️⃣ OpenRouter\n\nレート制限時は自動切り替え。同一リクエストは1時間キャッシュ。")
-    st.caption("v2.4 | SEC EDGAR / Yahoo Finance / Gemini+Groq+OpenRouter")
+    st.info(
+        "💡 株価データ フォールバック順\n"
+        "1️⃣ Tiingo（APIキー必要）\n"
+        "2️⃣ Stooq（無料・高速）\n"
+        "3️⃣ Yahoo Finance（無料）\n\n"
+        "AI フォールバック順\n"
+        "1️⃣ Gemini → 2️⃣ Groq → 3️⃣ OpenRouter"
+    )
+    st.caption("v2.5 | SEC EDGAR / Tiingo / Stooq / Yahoo Finance")
 
 end_date   = datetime.today().date()
 start_date = end_date - timedelta(days=years * 365)
@@ -593,17 +707,25 @@ start_date = end_date - timedelta(days=years * 365)
 # =============================================================
 with tab1:
     st.subheader("📊 NASDAQ-100 パフォーマンス分析")
+    st.caption("📡 株価データ: Tiingo → Stooq → Yahoo Finance の順で自動フォールバック")
+
     if st.button("▶ 全銘柄パフォーマンス分析を実行", type="primary"):
-        with st.spinner("データ取得・計算中..."):
+        with st.spinner("ベンチマーク（QQQ）データ取得中..."):
             market_returns = get_market_data(TIINGO_API_KEY, start_date, end_date)
+
         if market_returns is None:
-            st.error("市場データの取得に失敗しました")
+            st.error("市場データ（QQQ）の取得に全プロバイダーで失敗しました")
         else:
             progress = st.progress(0, text="銘柄データ取得中...")
             results  = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            # Yahoo Finance への並列リクエストが多すぎるとブロックされるため
+            # フォールバック時は max_workers を抑えて安全に取得する
+            max_workers = 8 if TIINGO_API_KEY else 4
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(analyze_ticker, t, market_returns, TIINGO_API_KEY, start_date, end_date): t
+                    executor.submit(
+                        analyze_ticker, t, market_returns, TIINGO_API_KEY, start_date, end_date
+                    ): t
                     for t in nasdaq100_tickers
                 }
                 for i, f in enumerate(concurrent.futures.as_completed(futures)):
@@ -621,8 +743,19 @@ with tab1:
                 df.insert(0, "値上がり順位",       df["年間リターン"].rank(ascending=False, method="min").astype(int))
                 df = df.sort_values("値上がり順位").reset_index(drop=True)
 
+                # データソース内訳を表示
+                if "データソース" in df.columns:
+                    source_counts = df["データソース"].value_counts()
+                    source_info = " | ".join([f"{k}: {v}銘柄" for k, v in source_counts.items()])
+                    st.info(f"📡 使用データソース内訳: {source_info}")
+
+                # 表示時はデータソース列を末尾に移動
+                display_cols = [c for c in df.columns if c != "データソース"] + (
+                    ["データソース"] if "データソース" in df.columns else []
+                )
+
                 st.dataframe(
-                    df.style
+                    df[display_cols].style
                     .format("{:.2%}", subset=["年間リターン", "年間リスク", "アルファ", "レジデュアルリスク"])
                     .format("{:.2f}", subset=["シャープレシオ", "ベータ"])
                     .format("{:d}",   subset=["値上がり順位", "シャープレシオ順位"]),
@@ -651,7 +784,7 @@ with tab1:
                                    file_name=f"Nasdaq100_Analysis_{end_date}.xlsx")
 
 # =============================================================
-# Tab 2: 決算分析（ぐるぐる防止の핵심ロジック）
+# Tab 2: 決算分析
 # =============================================================
 with tab2:
     st.subheader("📋 決算分析（SEC EDGAR + Yahoo Finance）")
@@ -663,19 +796,15 @@ with tab2:
         for ticker in selected_tickers:
             st.markdown(f"---\n### 🔍 {ticker}")
 
-            # ─ Step1: XBRL（スピナー付き・独立） ─────────────────
             with st.spinner(f"📡 {ticker} XBRL データ取得中..."):
-                xbrl_df = get_xbrl_financials(ticker)   # timeout=15 で確実に返る
+                xbrl_df = get_xbrl_financials(ticker)
 
-            # ─ Step2: Yahoo Finance（スピナー付き・独立） ─────────
             with st.spinner(f"📡 {ticker} 決算・EPS データ取得中..."):
-                earnings_info = get_earnings_data(ticker)  # timeout=(3,5) で確実に返る
+                earnings_info = get_earnings_data(ticker)
 
-            # ─ Step3: ニュース（スピナー付き・独立） ──────────────
             with st.spinner(f"📡 {ticker} ニュース取得中..."):
-                headlines = get_news_headlines(ticker, 5)  # timeout=(3,5) で確実に返る
+                headlines = get_news_headlines(ticker, 5)
 
-            # ─ 表示（スピナーなし・即時） ─────────────────────────
             cols = st.columns([1, 1])
 
             with cols[0]:
@@ -718,7 +847,6 @@ with tab2:
                 else:
                     st.info("EPS データが取得できませんでした（Yahoo Finance 制限の可能性）")
 
-            # ─ Step4: AI 分析（スピナー付き・独立・最後に実行） ──
             st.markdown("**🤖 AI 決算総合分析（日本語）**")
             xbrl_str = xbrl_df.to_string(index=False) if not xbrl_df.empty else "データなし"
             eps_str  = json.dumps(eps_history, ensure_ascii=False, indent=2) if eps_history else "データなし"
@@ -726,13 +854,11 @@ with tab2:
                 ai_analysis = ai_earnings_analysis(ticker, xbrl_str, eps_str)
             st.info(ai_analysis)
 
-            # ─ Step5: センチメント（スピナー付き・独立） ──────────
             st.markdown("**🎯 ニュース センチメント**")
             with st.spinner("🤖 センチメント分析中..."):
                 sentiment = ai_sentiment(tuple(headlines), ticker)
             st.info(sentiment)
 
-            # ─ SEC フィリング ─────────────────────────────────────
             filings = get_edgar_filings(ticker, filing_type, count=4)
             if filings:
                 st.markdown(f"**📄 SEC {filing_type} フィリング（直近4件）**")
@@ -741,12 +867,10 @@ with tab2:
                 st.dataframe(fdf, use_container_width=True,
                              column_config={"EDGARリンク": st.column_config.LinkColumn("EDGARリンク")})
 
-            # レポート蓄積
             all_reports[ticker] = build_text_report(
                 ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis
             )
 
-        # ── 一括ダウンロード ──────────────────────────────────────
         if all_reports:
             st.divider()
             combined = "\n\n".join(all_reports.values())
