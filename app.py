@@ -254,7 +254,7 @@ def _prices_from_tiingo(ticker: str, start, end, api_key: str) -> pd.Series | No
             f"https://api.tiingo.com/tiingo/daily/{ticker}/prices",
             params={"startDate": str(start), "endDate": str(end),
                     "resampleFreq": "daily", "token": api_key},
-            timeout=15,
+            timeout=(3, 8),  # connect 3秒 / read 8秒（旧: 15秒フラット）
         )
         if r.status_code != 200:
             return None
@@ -718,9 +718,9 @@ with tab1:
         else:
             progress = st.progress(0, text="銘柄データ取得中...")
             results  = []
-            # Yahoo Finance への並列リクエストが多すぎるとブロックされるため
-            # フォールバック時は max_workers を抑えて安全に取得する
-            max_workers = 8 if TIINGO_API_KEY else 4
+            # Tiingo は並列耐性が高いので 20 まで引き上げて高速化
+            # Stooq/Yahoo はレート制限があるため 5 に抑える
+            max_workers = 20 if TIINGO_API_KEY else 5
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(
