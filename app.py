@@ -921,34 +921,643 @@ def plot_eps_surprise(eps_history, ticker):
     return fig
 
 # =============================================================
-# UI
+# モジュールレベル定数
 # =============================================================
-st.title("🚀 NASDAQ-100 プロ仕様 銘柄分析ダッシュボード v2.5")
-
-with st.expander("🤖 AI プロバイダー状態", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    c1.metric("1️⃣ Gemini",     "✅ 設定済" if GEMINI_API_KEY     else "❌ 未設定", "gemini-2.0-flash → lite")
-    c2.metric("2️⃣ Groq",       "✅ 設定済" if GROQ_API_KEY       else "❌ 未設定", "llama-3.3-70b → 8b")
-    c3.metric("3️⃣ OpenRouter", "✅ 設定済" if OPENROUTER_API_KEY else "❌ 未設定", "gemini-flash → llama free")
-    if not any([GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY]):
-        st.warning("⚠️ AI APIキーが未設定です")
-
 MARKET_INDICES = [
-    ("^GSPC", "S&P 500"), ("^NDX", "NASDAQ 100"),
-    ("^DJI", "ダウ平均"), ("^RUT", "Russell 2000"),
+    ("^GSPC", "S&P 500",      "ES=F"),
+    ("^NDX",  "NASDAQ 100",   "NQ=F"),
+    ("^DJI",  "ダウ平均",     "YM=F"),
+    ("^RUT",  "Russell 2000", "RTY=F"),
 ]
 MARKET_MACRO = [
-    ("^VIX", "VIX（恐怖指数）"), ("^TNX", "米10年債利回り(%)"),
-    ("GC=F", "金 ($/oz)"), ("CL=F", "WTI原油 ($/bbl)"), ("DX-Y.NYB", "ドル指数 (DXY)"),
+    ("^VIX",     "VIX（恐怖指数）"),
+    ("^TNX",     "米10年債利回り(%)"),
+    ("GC=F",     "金 ($/oz)"),
+    ("CL=F",     "WTI原油 ($/bbl)"),
+    ("DX-Y.NYB", "ドル指数 (DXY)"),
 ]
-
-tab_market, tab_perf, tab_tech, tab_earnings, tab_news = st.tabs([
-    "📈 マーケット概況",
-    "📊 パフォーマンス分析",
-    "📉 テクニカル分析",
-    "📋 決算分析（EDGAR・EPS）",
-    "📰 ニュース翻訳・センチメント",
+DOW30_TICKERS = sorted([
+    "AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","DOW",
+    "GS","HD","HON","IBM","INTC","JNJ","JPM","KO","MCD","MMM",
+    "MRK","MSFT","NKE","PG","TRV","UNH","V","VZ","WBA","WMT",
 ])
+
+# =============================================================
+# センチメントスコア計算
+# =============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def calc_market_sentiment(index_ticker: str, futures_ticker: str) -> dict:
+    """テクニカル + 先物/CFD ファクターから市場センチメントスコアを算出
+    スコア範囲: ±12（SMA×3 ±1, RSI ±2, MACD ±1, 5d ±2, VIX ±2, CFD ±2）
+    """
+    ohlcv = get_ohlcv_data(index_ticker, 400)
+    if ohlcv.empty or len(ohlcv) < 50:
+        return {}
+
+    close   = ohlcv["Close"]
+    current = close.iloc[-1]
+    factors = []
+
+    # SMA 比較
+    for window, fname in [(20, "SMA20"), (50, "SMA50"), (200, "SMA200")]:
+        if len(close) < window:
+            continue
+        sma_val = close.rolling(window).mean().iloc[-1]
+        sc  = 1 if current > sma_val else -1
+        pct = (current / sma_val - 1) * 100
+        factors.append({
+            "ファクター": f"終値 vs {fname}",
+            "スコア":    sc,
+            "詳細":      f"{current:,.1f}  {'▲' if sc>0 else '▼'}  {fname} {sma_val:,.1f}  ({pct:+.1f}%)",
+        })
+
+    # RSI
+    rsi_val = calc_rsi(close).iloc[-1]
+    sc_rsi  = 2 if rsi_val < 22 else 1 if rsi_val < 30 else \
+              -2 if rsi_val > 78 else -1 if rsi_val > 70 else 0
+    factors.append({
+        "ファクター": "RSI(14)",
+        "スコア":    sc_rsi,
+        "詳細":      f"RSI = {rsi_val:.1f}  ({'買われすぎ' if rsi_val>70 else '売られすぎ' if rsi_val<30 else '中立圏'})",
+    })
+
+    # MACD
+    macd_l, sig_l, hist = calc_macd(close)
+    sc_macd    = 1 if hist.iloc[-1] > 0 else -1
+    cross_note = " ← ゴールデンクロス🟢" if hist.iloc[-1] > 0 and hist.iloc[-2] <= 0 else \
+                 " ← デッドクロス🔴"     if hist.iloc[-1] < 0 and hist.iloc[-2] >= 0 else ""
+    factors.append({
+        "ファクター": "MACD(12,26,9)",
+        "スコア":    sc_macd,
+        "詳細":      f"MACD {macd_l.iloc[-1]:.2f} / Signal {sig_l.iloc[-1]:.2f}{cross_note}",
+    })
+
+    # 5日モメンタム
+    if len(close) >= 6:
+        ret5  = (current / close.iloc[-6] - 1) * 100
+        sc_5d = 2 if ret5 > 2 else 1 if ret5 > 0.5 else \
+                -2 if ret5 < -2 else -1 if ret5 < -0.5 else 0
+        factors.append({
+            "ファクター": "5日モメンタム",
+            "スコア":    sc_5d,
+            "詳細":      f"5営業日リターン: {ret5:+.2f}%",
+        })
+
+    # VIX
+    vix_df = get_quote_data(("^VIX",))
+    if not vix_df.empty and pd.notna(vix_df.iloc[0]["現在値"]):
+        vix_val   = vix_df.iloc[0]["現在値"]
+        sc_vix    = 2 if vix_val < 14 else 1 if vix_val < 18 else \
+                    -2 if vix_val > 30 else -1 if vix_val > 23 else 0
+        vix_label = "極度の楽観" if vix_val < 14 else "低ボラ" if vix_val < 18 else \
+                    "警戒域"     if vix_val < 23 else "高ボラ" if vix_val < 30 else "恐怖"
+        factors.append({
+            "ファクター": "VIX（恐怖指数）",
+            "スコア":    sc_vix,
+            "詳細":      f"VIX = {vix_val:.1f}  ({vix_label})",
+        })
+
+    # 先物/CFD（24h取引 — 土日・時間外も反映）
+    fut_df = get_quote_data((futures_ticker,))
+    if not fut_df.empty and pd.notna(fut_df.iloc[0]["現在値"]):
+        fut_price = fut_df.iloc[0]["現在値"]
+        fut_chgp  = fut_df.iloc[0]["前日比%"]
+        if pd.notna(fut_chgp):
+            sc_cfd = 2 if fut_chgp > 1.5 else 1 if fut_chgp > 0.3 else \
+                     -2 if fut_chgp < -1.5 else -1 if fut_chgp < -0.3 else 0
+            factors.append({
+                "ファクター": f"先物/CFD ({futures_ticker})",
+                "スコア":    sc_cfd,
+                "詳細":      f"{fut_price:,.1f}  前日比: {fut_chgp:+.2f}%  ※土日・時間外も反映",
+            })
+
+    total = sum(f["スコア"] for f in factors)
+    if   total >= 7:  verdict = "🟢 強気"
+    elif total >= 3:  verdict = "🟡 やや強気"
+    elif total >= -2: verdict = "⚪ 中立"
+    elif total >= -6: verdict = "🟠 やや弱気"
+    else:             verdict = "🔴 弱気"
+
+    return {"total": total, "verdict": verdict, "factors": factors}
+
+
+# =============================================================
+# モメンタムランキング用
+# =============================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_tickers() -> list[str]:
+    """Wikipedia から S&P500 構成銘柄を取得"""
+    try:
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            attrs={"id": "constituents"},
+        )
+        return tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        return []
+
+
+def _fetch_closes_30d(ticker: str) -> pd.Series | None:
+    """Yahoo Finance から30日分の終値を高速取得（モメンタム専用）"""
+    try:
+        end_ts   = int(datetime.today().timestamp())
+        start_ts = int((datetime.today() - timedelta(days=40)).timestamp())
+        r = requests.get(
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+            f"?interval=1d&period1={start_ts}&period2={end_ts}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 5),
+        )
+        if r.status_code != 200:
+            return None
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return None
+        closes = result[0].get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
+        dates  = pd.to_datetime(result[0].get("timestamp", []), unit="s").normalize()
+        return pd.Series(closes, index=dates, dtype=float).dropna()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def calc_momentum_scores(tickers: tuple, workers: int = 15) -> pd.DataFrame:
+    """当日/5日/20日リターンの加重スコア（0.5/0.3/0.2）でランキング"""
+
+    def _score(ticker: str) -> dict | None:
+        c = _fetch_closes_30d(ticker)
+        if c is None or len(c) < 6:
+            return None
+        r1  = (c.iloc[-1] / c.iloc[-2]  - 1) * 100 if len(c) >= 2  else 0.0
+        r5  = (c.iloc[-1] / c.iloc[-6]  - 1) * 100 if len(c) >= 6  else 0.0
+        r20 = (c.iloc[-1] / c.iloc[-21] - 1) * 100 if len(c) >= 21 else 0.0
+        return {"銘柄": ticker, "当日(%)": round(r1,2), "5日(%)": round(r5,2),
+                "20日(%)": round(r20,2), "スコア": round(r1*0.5 + r5*0.3 + r20*0.2, 3)}
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for r in concurrent.futures.as_completed({ex.submit(_score, t): t for t in tickers}):
+            v = r.result()
+            if v:
+                results.append(v)
+    if not results:
+        return pd.DataFrame()
+    df = pd.DataFrame(results).sort_values("スコア", ascending=False).reset_index(drop=True)
+    df.insert(0, "順位", range(1, len(df) + 1))
+    return df
+
+
+# =============================================================
+# Page functions
+# =============================================================
+
+def page_market():
+    st.title("📈 マーケット概況")
+
+    ref_col, _ = st.columns([1, 5])
+    if ref_col.button("🔄 データ更新"):
+        st.cache_data.clear()
+        st.rerun()
+
+    # ── センチメントスコア ────────────────────────────────────
+    st.markdown("#### 🎯 市場センチメント（テクニカル + 先物/CFD）")
+    with st.spinner("センチメント計算中..."):
+        sp_sent = calc_market_sentiment("^GSPC", "ES=F")
+        nq_sent = calc_market_sentiment("^NDX",  "NQ=F")
+
+    sc1, sc2 = st.columns(2)
+    for col, name, sent in [(sc1, "S&P 500", sp_sent), (sc2, "NASDAQ 100", nq_sent)]:
+        with col:
+            if sent:
+                st.metric(f"{name} センチメント", sent["verdict"],
+                          f"合計スコア: {sent['total']:+d}  /  最大 ±12",
+                          delta_color="off")
+                with st.expander("📊 ファクター別スコア詳細"):
+                    fdf = pd.DataFrame(sent["factors"])
+                    def _sc_style(v):
+                        if isinstance(v, (int, float)):
+                            return "color:#26A69A;font-weight:bold" if v > 0 else \
+                                   "color:#EF5350;font-weight:bold" if v < 0 else ""
+                        return ""
+                    st.dataframe(fdf.style.applymap(_sc_style, subset=["スコア"]),
+                                 use_container_width=True, hide_index=True)
+            else:
+                st.warning(f"{name}: データ取得失敗")
+
+    st.divider()
+
+    # ── 主要指数 + 先物 CFD ───────────────────────────────────
+    st.markdown("#### 主要指数 + 先物/CFD（土日・時間外も反映）")
+    all_idx = tuple(sym for sym,_,_ in MARKET_INDICES) + \
+              tuple(fut for _,_,fut in MARKET_INDICES)
+    with st.spinner("指数・先物データ取得中..."):
+        idx_df = get_quote_data(all_idx)
+
+    if not idx_df.empty:
+        for sym, label, fut in MARKET_INDICES:
+            ri = idx_df[idx_df["シンボル"] == sym]
+            rf = idx_df[idx_df["シンボル"] == fut]
+            ci, cf = st.columns(2)
+            with ci:
+                if not ri.empty and pd.notna(ri.iloc[0]["現在値"]):
+                    p = ri.iloc[0]["現在値"]; cp = ri.iloc[0]["前日比%"]
+                    st.metric(f"📊 {label}", f"{p:,.2f}", f"{cp:+.2f}%" if pd.notna(cp) else None)
+            with cf:
+                if not rf.empty and pd.notna(rf.iloc[0]["現在値"]):
+                    fp = rf.iloc[0]["現在値"]; fcp = rf.iloc[0]["前日比%"]
+                    st.metric(f"📉 先物 {fut}", f"{fp:,.2f}", f"{fcp:+.2f}%" if pd.notna(fcp) else None)
+
+    st.divider()
+
+    # ── マクロ経済指標 ────────────────────────────────────────
+    st.markdown("#### マクロ経済指標")
+    with st.spinner("マクロデータ取得中..."):
+        mac_df = get_quote_data(tuple(s for s,_ in MARKET_MACRO))
+
+    if not mac_df.empty:
+        mac_cols = st.columns(5)
+        for col, (sym, label) in zip(mac_cols, MARKET_MACRO):
+            row = mac_df[mac_df["シンボル"] == sym]
+            if not row.empty and pd.notna(row.iloc[0]["現在値"]):
+                p = row.iloc[0]["現在値"]; cp = row.iloc[0]["前日比%"]
+                col.metric(label, f"{p:.2f}", f"{cp:+.2f}%" if pd.notna(cp) else None,
+                           delta_color="inverse" if sym == "^VIX" else "normal")
+
+    st.divider()
+
+    # ── 個別銘柄リアルタイム ──────────────────────────────────
+    st.markdown("#### 個別銘柄 リアルタイム株価")
+    rt_tickers = st.multiselect(
+        "銘柄を選択（最大20銘柄）", nasdaq100_tickers,
+        default=["AAPL","MSFT","NVDA","META","GOOGL","AMZN"],
+        max_selections=20,
+    )
+    if rt_tickers:
+        with st.spinner("株価データ取得中..."):
+            rt_df = get_quote_data(tuple(rt_tickers))
+        if not rt_df.empty:
+            disp = rt_df.copy()
+            disp["現在値"] = disp["現在値"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+            disp["前日比"]  = disp["前日比"].apply(lambda x: f"{x:+.2f}" if pd.notna(x) else "N/A")
+            disp["前日比%"] = disp["前日比%"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── ニュース ──────────────────────────────────────────────
+    st.markdown("#### 📰 最新ニュース")
+    with st.spinner("ニュース取得中（全ソース並列）..."):
+        mkt_news = get_market_news()
+
+    def _news_tabs(items: list[dict], key_prefix: str) -> None:
+        if not items:
+            st.info("取得できませんでした。")
+            return
+        with st.spinner("タイトル翻訳中..."):
+            title_map = ai_translate_titles(tuple(i["見出し"] for i in items))
+        sources = list(dict.fromkeys(i["ソース"] for i in items))
+        for ntab, src in zip(st.tabs(sources), sources):
+            with ntab:
+                for idx, item in enumerate(i for i in items if i["ソース"] == src):
+                    orig = item["見出し"]; ja = title_map.get(orig, orig)
+                    ds   = f"  `{item['日時']}`" if item["日時"] else ""
+                    if item["リンク"]:
+                        st.markdown(f"**[{ja}]({item['リンク']})**{ds}")
+                    else:
+                        st.markdown(f"**{ja}**{ds}")
+                    st.caption(f"🔤 {orig}")
+                    if item.get("概要"):
+                        with st.expander("📄 記事概要を翻訳"):
+                            st.caption(item["概要"])
+                            if st.button("🤖 日本語に翻訳", key=f"desc_{key_prefix}_{src}_{idx}"):
+                                with st.spinner("翻訳中..."):
+                                    st.info(ai_translate_description(item["概要"]))
+                    st.markdown("---")
+
+    nm, nt = st.columns(2)
+    with nm:
+        st.markdown("**📊 市場全般**")
+        _news_tabs([i for i in mkt_news if i["カテゴリ"] == "market"], "m")
+    with nt:
+        st.markdown("**💻 ハイテク系**")
+        _news_tabs([i for i in mkt_news if i["カテゴリ"] == "tech"],   "t")
+
+
+def page_performance():
+    st.title("📊 パフォーマンス分析")
+    st.caption("📡 株価データ: Tiingo → Stooq → Yahoo Finance の順で自動フォールバック")
+
+    with st.sidebar:
+        st.header("設定")
+        years = st.slider("分析対象期間（年）", 1, 10, 3)
+        st.info("💡 データ順\n1️⃣ Tiingo → 2️⃣ Stooq → 3️⃣ Yahoo\n\nAI順\n1️⃣ Gemini → 2️⃣ Groq → 3️⃣ OpenRouter")
+
+    end_date   = datetime.today().date()
+    start_date = end_date - timedelta(days=years * 365)
+
+    if not st.button("▶ 全銘柄パフォーマンス分析を実行", type="primary"):
+        return
+
+    with st.spinner("ベンチマーク（QQQ）データ取得中..."):
+        market_returns = get_market_data(TIINGO_API_KEY, start_date, end_date)
+    if market_returns is None:
+        st.error("市場データ（QQQ）の取得に全プロバイダーで失敗しました")
+        return
+
+    progress    = st.progress(0, text="銘柄データ取得中...")
+    results     = []
+    max_workers = 20 if TIINGO_API_KEY else 5
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futs = {executor.submit(analyze_ticker, t, market_returns, TIINGO_API_KEY, start_date, end_date): t
+                for t in nasdaq100_tickers}
+        for i, f in enumerate(concurrent.futures.as_completed(futs)):
+            r = f.result()
+            if r: results.append(r)
+            progress.progress((i+1)/len(futs), text=f"取得中... {i+1}/{len(futs)}")
+    progress.empty()
+
+    df = pd.DataFrame(results)
+    if df.empty:
+        st.error("有効な分析結果がありません"); return
+
+    df.insert(0, "シャープレシオ順位", df["シャープレシオ"].rank(ascending=False, method="min").astype(int))
+    df.insert(0, "値上がり順位",       df["年間リターン"].rank(ascending=False, method="min").astype(int))
+    df = df.sort_values("値上がり順位").reset_index(drop=True)
+    if "データソース" in df.columns:
+        st.info("📡 " + " | ".join(f"{k}: {v}銘柄" for k,v in df["データソース"].value_counts().items()))
+    df["Yahoo Finance"] = df["銘柄"].apply(lambda t: f"https://finance.yahoo.com/quote/{t}/")
+    base = ["値上がり順位","シャープレシオ順位","銘柄","Yahoo Finance",
+            "年間リターン","年間リスク","シャープレシオ","ベータ","アルファ","レジデュアルリスク"]
+    dcols = [c for c in base if c in df.columns]
+    if "データソース" in df.columns: dcols.append("データソース")
+    st.dataframe(
+        df[dcols].style
+        .format("{:.2%}", subset=["年間リターン","年間リスク","アルファ","レジデュアルリスク"])
+        .format("{:.2f}", subset=["シャープレシオ","ベータ"])
+        .format("{:d}",   subset=["値上がり順位","シャープレシオ順位"]),
+        use_container_width=True,
+        column_config={"Yahoo Finance": st.column_config.LinkColumn("Yahoo Finance", display_text="📈 表示")},
+    )
+    top = df.sort_values("シャープレシオ", ascending=False).head(20)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
+    ax1.bar(top["銘柄"], top["年間リターン"]*100, label="リターン(%)", color="#4472C4")
+    ax1.bar(top["銘柄"], top["年間リスク"]  *100, label="リスク(%)",   color="#ED7D31", alpha=0.3)
+    ax1.legend(); ax1.set_title("年間リターン / リスク（上位20銘柄）")
+    ax2.bar(top["銘柄"], top["シャープレシオ"], color="#70AD47")
+    ax2.set_title("シャープレシオ（上位20銘柄）")
+    plt.tight_layout(); st.pyplot(fig)
+    st.subheader("🤖 AIによる企業解説（上位3社）")
+    for t in top["銘柄"].head(3):
+        with st.expander(f"💡 {t} の概要"):
+            st.write(ai_company_summary(t))
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Analysis")
+    st.download_button("📥 Excelでダウンロード", data=output.getvalue(),
+                       file_name=f"Nasdaq100_Analysis_{end_date}.xlsx")
+
+
+def page_tech():
+    st.title("📉 テクニカル分析チャート")
+    tc1, tc2 = st.columns([3, 1])
+    with tc1:
+        tech_ticker = st.selectbox("銘柄を選択", nasdaq100_tickers,
+                                    index=nasdaq100_tickers.index("AAPL") if "AAPL" in nasdaq100_tickers else 0)
+    with tc2:
+        period_label = st.selectbox("期間", ["3ヶ月","6ヶ月","1年","2年","3年"], index=2)
+    period_map = {"3ヶ月":90,"6ヶ月":180,"1年":365,"2年":730,"3年":1095}
+
+    if not st.button("▶ チャートを表示", type="primary"):
+        return
+    with st.spinner(f"📡 {tech_ticker} OHLCV データ取得中..."):
+        ohlcv = get_ohlcv_data(tech_ticker, period_map[period_label])
+    if ohlcv.empty:
+        st.error("データの取得に失敗しました。"); return
+
+    st.plotly_chart(build_tech_chart(ohlcv, tech_ticker), use_container_width=True)
+    close = ohlcv["Close"]; rsi_now = calc_rsi(close).iloc[-1]
+    macd_l, _, hist = calc_macd(close)
+    s1, s2, s3 = st.columns(3)
+    s1.metric("RSI (14)", f"{rsi_now:.1f}",
+              "🔴 買われすぎ" if rsi_now>70 else "🟢 売られすぎ" if rsi_now<30 else "⚪ 中立",
+              delta_color="off")
+    ms = ("🟢 ゴールデンクロス" if hist.iloc[-1]>0 and hist.iloc[-2]<=0 else
+          "🔴 デッドクロス"     if hist.iloc[-1]<0 and hist.iloc[-2]>=0 else
+          "↑ 強気" if hist.iloc[-1]>0 else "↓ 弱気")
+    s2.metric("MACD", f"{macd_l.iloc[-1]:.3f}", ms, delta_color="off")
+    sma50 = close.rolling(50).mean().iloc[-1]
+    s3.metric("現在値 vs SMA50", f"${close.iloc[-1]:.2f}",
+              "↑ SMA50 上回り" if close.iloc[-1]>sma50 else "↓ SMA50 下回り",
+              delta_color="normal" if close.iloc[-1]>sma50 else "inverse")
+
+
+def page_earnings():
+    st.title("📋 決算分析（SEC EDGAR + Yahoo Finance）")
+    with st.sidebar:
+        st.header("決算分析設定")
+        selected_tickers = st.multiselect("分析する銘柄を選択", nasdaq100_tickers,
+                                           default=["AAPL","MSFT","NVDA"], max_selections=10)
+        filing_type  = st.selectbox("SEC フィリング種別", ["10-K","10-Q"])
+        st.divider()
+        enable_email = st.checkbox("決算レポートをメールで通知", value=False)
+
+    end_date = datetime.today().date()
+    if not selected_tickers:
+        st.info("サイドバーで銘柄を選択してください"); return
+    if not st.button("▶ 決算データを取得・分析", type="primary"):
+        return
+
+    all_reports: dict[str, str] = {}
+    for ticker in selected_tickers:
+        st.markdown(f"---\n### 🔍 {ticker}")
+        with st.spinner(f"📡 {ticker} XBRL 取得中..."):      xbrl_df = get_xbrl_financials(ticker)
+        with st.spinner(f"📡 {ticker} 決算・EPS 取得中..."):  earnings_info = get_earnings_data(ticker)
+        with st.spinner(f"📡 {ticker} ニュース取得中..."):    headlines = get_news_headlines(ticker, 5)
+        cols = st.columns([1,1])
+        with cols[0]:
+            st.markdown("**📈 XBRL 財務データ（SEC EDGAR）**")
+            if not xbrl_df.empty:
+                ddf = xbrl_df.copy()
+                for c in ["売上高","純利益"]:
+                    if c in ddf.columns:
+                        ddf[c] = ddf[c].apply(lambda v: f"${v/1e9:.2f}B" if pd.notna(v) and v!=0 else "N/A")
+                if "EPS（基本）" in ddf.columns:
+                    ddf["EPS（基本）"] = ddf["EPS（基本）"].apply(lambda v: f"${v:.2f}" if pd.notna(v) else "N/A")
+                st.dataframe(ddf, use_container_width=True)
+                fig_q = plot_xbrl_quarterly(xbrl_df, ticker)
+                if fig_q: st.pyplot(fig_q)
+            else:
+                st.warning("XBRL データが取得できませんでした")
+        eps_history = earnings_info.get("EPS履歴", [])
+        with cols[1]:
+            st.markdown("**📅 決算発表日・EPS サプライズ**")
+            per_val = earnings_info.get("PER(予想)"); pbr_val = earnings_info.get("PBR")
+            st.markdown(f"- **次回決算日**: {earnings_info.get('次回決算日','N/A')}")
+            st.markdown(f"- **予想PER**: {f'{per_val:.1f}' if per_val else 'N/A'}")
+            st.markdown(f"- **PBR**: {f'{pbr_val:.2f}' if pbr_val else 'N/A'}")
+            if eps_history:
+                st.dataframe(pd.DataFrame(eps_history), use_container_width=True)
+                fig_eps = plot_eps_surprise(eps_history, ticker)
+                if fig_eps: st.pyplot(fig_eps)
+                beats = sum(1 for e in eps_history if e.get("サプライズ%") and e["サプライズ%"]>0)
+                total = len([e for e in eps_history if e.get("サプライズ%") is not None])
+                if total: st.metric("直近4四半期 EPS Beat率", f"{beats}/{total} ({beats/total*100:.0f}%)")
+            else:
+                st.info("EPS データが取得できませんでした")
+        st.markdown("**🤖 AI 決算総合分析（日本語）**")
+        xbrl_str = xbrl_df.to_string(index=False) if not xbrl_df.empty else "データなし"
+        eps_str  = json.dumps(eps_history, ensure_ascii=False, indent=2) if eps_history else "データなし"
+        with st.spinner("🤖 AI 分析中..."): ai_analysis = ai_earnings_analysis(ticker, xbrl_str, eps_str)
+        st.info(ai_analysis)
+        st.markdown("**🎯 ニュース センチメント**")
+        with st.spinner("🤖 センチメント分析中..."): sentiment = ai_sentiment(tuple(headlines), ticker)
+        st.info(sentiment)
+        filings = get_edgar_filings(ticker, filing_type, count=4)
+        if filings:
+            st.markdown(f"**📄 SEC {filing_type} フィリング（直近4件）**")
+            fdf = pd.DataFrame(filings)[["form","date","url"]]
+            fdf.columns = ["種別","提出日","EDGARリンク"]
+            st.dataframe(fdf, use_container_width=True,
+                         column_config={"EDGARリンク": st.column_config.LinkColumn("EDGARリンク")})
+        all_reports[ticker] = build_text_report(ticker, earnings_info, xbrl_df, headlines, sentiment, ai_analysis)
+
+    if all_reports:
+        st.divider()
+        combined = "\n\n".join(all_reports.values())
+        st.download_button("📥 全銘柄レポートをテキストでダウンロード",
+                           data=combined.encode("utf-8"),
+                           file_name=f"EarningsReport_{end_date}.txt", mime="text/plain")
+        if enable_email:
+            subject = f"【NASDAQ決算速報】{', '.join(selected_tickers)} | {end_date}"
+            ok, msg = send_email_notification(subject, combined,
+                                               attachment_bytes=combined.encode("utf-8"),
+                                               filename=f"EarningsReport_{end_date}.txt")
+            st.success(f"✅ {msg}") if ok else st.warning(f"⚠️ {msg}")
+
+
+def page_news():
+    st.title("📰 ニュース翻訳・センチメント分析")
+    news_ticker = st.selectbox("銘柄を選択", nasdaq100_tickers,
+                                index=nasdaq100_tickers.index("AAPL") if "AAPL" in nasdaq100_tickers else 0)
+    max_news = st.slider("取得ニュース件数", 3, 20, 8)
+    if not st.button("▶ ニュースを取得・翻訳", type="primary"):
+        return
+    with st.spinner("ニュース取得中..."):
+        headlines = get_news_headlines(news_ticker, max_news)
+    if not headlines:
+        st.warning("ニュースが取得できませんでした（Yahoo Finance 制限の可能性）"); return
+    st.markdown(f"### 📰 {news_ticker} 最新ニュース（英語原文）")
+    for i, h in enumerate(headlines, 1): st.markdown(f"{i}. {h}")
+    st.markdown("---")
+    st.markdown("### 🎯 センチメント分析（AI）")
+    with st.spinner("センチメント分析中..."): sentiment_result = ai_sentiment(tuple(headlines), news_ticker)
+    st.info(sentiment_result)
+    st.markdown("---")
+    st.markdown("### 🌐 AI 日本語翻訳・要約")
+    with st.spinner("翻訳・要約中..."):
+        translation = ai_translate_and_summarize("\n".join(headlines), context=f"{news_ticker}に関するニュース見出し一覧")
+    st.success(translation)
+    end_date    = datetime.today().date()
+    report_news = f"# {news_ticker} ニュースレポート ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
+    report_news += "## 英語原文\n" + "\n".join(f"- {h}" for h in headlines)
+    report_news += f"\n\n## センチメント分析\n{sentiment_result}"
+    report_news += f"\n\n## 日本語翻訳・要約\n{translation}"
+    st.download_button("📥 ニュースレポートを保存",
+                       data=report_news.encode("utf-8"),
+                       file_name=f"{news_ticker}_news_{end_date}.txt", mime="text/plain")
+
+
+def page_momentum():
+    st.title("🚀 モメンタムランキング")
+    st.caption("当日・5日・20日リターンの加重平均スコア（0.5/0.3/0.2）で上昇力の強い銘柄を表示")
+
+    with st.sidebar:
+        st.header("設定")
+        index_choice = st.selectbox("対象インデックス",
+                                     ["NASDAQ-100", "Dow Jones 30", "S&P 500"])
+        top_n = st.slider("表示件数", 10, 50, 20)
+
+    if index_choice == "NASDAQ-100":
+        tickers = nasdaq100_tickers
+    elif index_choice == "Dow Jones 30":
+        tickers = DOW30_TICKERS
+    else:
+        with st.spinner("S&P500 構成銘柄リスト取得中..."):
+            tickers = get_sp500_tickers()
+        if not tickers:
+            st.warning("S&P500 リスト取得失敗。NASDAQ-100 で代替します。")
+            tickers = nasdaq100_tickers
+
+    if not st.button("▶ ランキングを計算", type="primary"):
+        st.info(f"ボタンを押すと {len(tickers)} 銘柄のモメンタムを計算します。")
+        return
+
+    prog = st.progress(0, text="計算中...")
+    with st.spinner(f"{len(tickers)} 銘柄のスコア計算中..."):
+        mom_df = calc_momentum_scores(tuple(tickers))
+    prog.empty()
+
+    if mom_df.empty:
+        st.error("データの取得に失敗しました。"); return
+
+    top_df = mom_df.head(top_n)
+    bot_df = mom_df.tail(top_n).sort_values("スコア")
+
+    ct, cb = st.columns(2)
+    with ct:
+        st.markdown(f"**↑ 上昇モメンタム上位 {top_n}**")
+        st.dataframe(top_df.style
+                     .format("{:+.2f}", subset=["当日(%)","5日(%)","20日(%)","スコア"])
+                     .background_gradient(subset=["スコア"], cmap="Greens"),
+                     use_container_width=True, hide_index=True)
+    with cb:
+        st.markdown(f"**↓ 下落モメンタム上位 {top_n}**")
+        st.dataframe(bot_df.style
+                     .format("{:+.2f}", subset=["当日(%)","5日(%)","20日(%)","スコア"])
+                     .background_gradient(subset=["スコア"], cmap="Reds_r"),
+                     use_container_width=True, hide_index=True)
+
+    fig = go.Figure([go.Bar(x=top_df["銘柄"], y=top_df["スコア"],
+                            marker_color="#26A69A", name="上昇")])
+    fig.update_layout(title=f"モメンタムスコア上位 {top_n}（{index_choice}）",
+                      template="plotly_dark", height=400,
+                      margin=dict(l=20,r=20,t=40,b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# =============================================================
+# Navigation（サイドバー）
+# =============================================================
+with st.sidebar:
+    st.markdown("### 🚀 米国株ダッシュボード")
+    page_sel = st.radio(
+        "ページ選択",
+        ["📈 マーケット概況",
+         "📊 パフォーマンス分析",
+         "📉 テクニカル分析",
+         "📋 決算分析",
+         "📰 ニュース翻訳",
+         "🚀 モメンタムランキング"],
+        label_visibility="collapsed",
+    )
+    st.divider()
+    with st.expander("🤖 AI プロバイダー状態"):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Gemini",     "✅" if GEMINI_API_KEY     else "❌")
+        c2.metric("Groq",       "✅" if GROQ_API_KEY       else "❌")
+        c3.metric("OpenRouter", "✅" if OPENROUTER_API_KEY else "❌")
+    st.caption("v3.0 | Tiingo / Stooq / Yahoo / SEC EDGAR")
+
+PAGE_MAP = {
+    "📈 マーケット概況":      page_market,
+    "📊 パフォーマンス分析":   page_performance,
+    "📉 テクニカル分析":       page_tech,
+    "📋 決算分析":             page_earnings,
+    "📰 ニュース翻訳":         page_news,
+    "🚀 モメンタムランキング": page_momentum,
+}
+PAGE_MAP[page_sel]()
 
 # ── サイドバー ────────────────────────────────────────────────
 with st.sidebar:
