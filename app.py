@@ -1109,6 +1109,23 @@ def calc_momentum_scores(tickers: tuple, workers: int = 15) -> pd.DataFrame:
 
 
 # =============================================================
+# マーケットスクリーン用スパークラインキャッシュ
+# =============================================================
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_sparkline_data(tickers: tuple) -> dict:
+    """30日分終値を並列取得して dict[ticker->Series] で返す"""
+    result: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        futures = {ex.submit(_fetch_closes_30d, t): t for t in tickers}
+        for f in concurrent.futures.as_completed(futures):
+            t = futures[f]; s = f.result()
+            if s is not None and len(s) > 1:
+                result[t] = s.tail(30)
+    return result
+
+
+# =============================================================
 # セクター比較
 # =============================================================
 OPTICAL_TICKERS = ["CIEN", "COHR", "LITE", "VIAV", "AAOI"]
@@ -1807,13 +1824,158 @@ def page_sentiment_chart():
 
 
 # =============================================================
+# マーケットスクリーン
+# =============================================================
+
+_SCREEN_SECTIONS = [
+    ("🇺🇸 米国指数", [
+        ("^DJI",      "ダウ平均"),
+        ("^IXIC",     "ナスダック"),
+        ("^GSPC",     "S&P 500"),
+        ("^NDX",      "NASDAQ 100"),
+        ("^RUT",      "Russell 2000"),
+    ]),
+    ("⚡ 先物 / CFD（24時間）", [
+        ("ES=F",      "S&P先物"),
+        ("NQ=F",      "NQ先物"),
+        ("YM=F",      "ダウ先物"),
+        ("RTY=F",     "Russell先物"),
+    ]),
+    ("📊 マクロ / 商品 / 為替", [
+        ("^VIX",      "VIX"),
+        ("^TNX",      "米10年債利回り"),
+        ("GC=F",      "金 (Gold)"),
+        ("CL=F",      "原油 (WTI)"),
+        ("DX-Y.NYB",  "ドル指数 (DXY)"),
+        ("USDJPY=X",  "USD/JPY"),
+        ("EURUSD=X",  "EUR/USD"),
+        ("GBPUSD=X",  "GBP/USD"),
+    ]),
+    ("₿ 仮想通貨", [
+        ("BTC-USD",   "Bitcoin"),
+        ("ETH-USD",   "Ethereum"),
+        ("SOL-USD",   "Solana"),
+        ("BNB-USD",   "BNB"),
+    ]),
+    ("💻 テック大型株", [
+        ("AAPL",      "Apple"),
+        ("MSFT",      "Microsoft"),
+        ("NVDA",      "NVIDIA"),
+        ("META",      "Meta"),
+        ("TSLA",      "Tesla"),
+        ("GOOGL",     "Alphabet"),
+        ("AMZN",      "Amazon"),
+        ("AVGO",      "Broadcom"),
+    ]),
+]
+
+
+def _make_sparkline_fig(closes: pd.Series, is_up: bool) -> "go.Figure":
+    color     = "#26A69A" if is_up else "#EF5350"
+    fill      = "rgba(38,166,154,0.15)" if is_up else "rgba(239,83,80,0.15)"
+    fig = go.Figure(go.Scatter(
+        y=closes.values, mode="lines",
+        line=dict(color=color, width=1.5),
+        fill="tozeroy", fillcolor=fill,
+        hoverinfo="skip",
+    ))
+    fig.update_layout(
+        height=55, margin=dict(l=0, r=0, t=0, b=0),
+        xaxis=dict(visible=False, fixedrange=True),
+        yaxis=dict(visible=False, fixedrange=True),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    return fig
+
+
+def page_market_screen():
+    st.title("🖥️ マーケットスクリーン")
+    st.caption("世界主要指数・先物・マクロ・仮想通貨・個別株のリアルタイム一覧（30日スパークライン付き）")
+
+    NCOLS = 4
+
+    # 全ティッカー収集
+    all_instruments: list[tuple[str, str]] = []
+    for _sec, items in _SCREEN_SECTIONS:
+        all_instruments.extend(items)
+    all_tickers = tuple(dict.fromkeys(t for t, _ in all_instruments))  # 重複除去・順序保持
+
+    col_refresh, col_ts = st.columns([1, 5])
+    if col_refresh.button("🔄 更新", key="screen_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner("データ取得中..."):
+        quote_df   = get_quote_data(all_tickers)
+        sparklines = get_sparkline_data(all_tickers)
+
+    if not quote_df.empty:
+        ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        col_ts.caption(f"最終取得: {ts} (UTC)")
+
+    for section_title, instruments in _SCREEN_SECTIONS:
+        st.subheader(section_title)
+
+        for row_start in range(0, len(instruments), NCOLS):
+            row_items = instruments[row_start:row_start + NCOLS]
+            # 端数を埋めるための空列調整
+            cols = st.columns(NCOLS)
+
+            for ci, (ticker, name) in enumerate(row_items):
+                with cols[ci]:
+                    q     = quote_df[quote_df["シンボル"] == ticker]
+                    price = float(q.iloc[0]["現在値"])  if not q.empty and pd.notna(q.iloc[0]["現在値"])  else None
+                    chg   = float(q.iloc[0]["前日比"])  if not q.empty and pd.notna(q.iloc[0]["前日比"])  else None
+                    chgp  = float(q.iloc[0]["前日比%"]) if not q.empty and pd.notna(q.iloc[0]["前日比%"]) else None
+
+                    is_up     = (chgp or 0.0) >= 0
+                    color_hex = "#26A69A" if is_up else "#EF5350"
+
+                    # 数値フォーマット
+                    if price is not None:
+                        if price < 0.01:
+                            price_str = f"{price:.6f}"
+                        elif price < 1:
+                            price_str = f"{price:.4f}"
+                        elif price >= 10000:
+                            price_str = f"{price:,.0f}"
+                        else:
+                            price_str = f"{price:,.2f}"
+                    else:
+                        price_str = "---"
+
+                    delta_str = f"{chgp:+.2f}%" if chgp is not None else None
+
+                    st.metric(
+                        label=f"{name}  `{ticker}`",
+                        value=price_str,
+                        delta=delta_str,
+                    )
+
+                    closes = sparklines.get(ticker)
+                    if closes is not None and len(closes) > 2:
+                        spark = _make_sparkline_fig(closes, is_up)
+                        st.plotly_chart(
+                            spark,
+                            use_container_width=True,
+                            config={"staticPlot": True, "displayModeBar": False},
+                            key=f"spark_{ticker}",
+                        )
+
+        st.markdown("---")
+
+
+# =============================================================
 # Navigation（サイドバー）
 # =============================================================
 with st.sidebar:
     st.markdown("### 🚀 米国株ダッシュボード")
     page_sel = st.radio(
         "ページ選択",
-        ["📈 マーケット概況",
+        ["🖥️ マーケットスクリーン",
+         "📈 マーケット概況",
          "📊 パフォーマンス分析",
          "📉 テクニカル分析",
          "📋 決算分析",
@@ -1832,14 +1994,15 @@ with st.sidebar:
     st.caption("v3.0 | Tiingo / Stooq / Yahoo / SEC EDGAR")
 
 PAGE_MAP = {
-    "📈 マーケット概況":      page_market,
-    "📊 パフォーマンス分析":   page_performance,
-    "📉 テクニカル分析":       page_tech,
-    "📋 決算分析":             page_earnings,
-    "📰 ニュース翻訳":         page_news,
-    "🚀 モメンタムランキング": page_momentum,
-    "📡 セクター比較":         page_sector_comparison,
-    "📊 センチメント推移":     page_sentiment_chart,
+    "🖥️ マーケットスクリーン":  page_market_screen,
+    "📈 マーケット概況":        page_market,
+    "📊 パフォーマンス分析":     page_performance,
+    "📉 テクニカル分析":         page_tech,
+    "📋 決算分析":               page_earnings,
+    "📰 ニュース翻訳":           page_news,
+    "🚀 モメンタムランキング":   page_momentum,
+    "📡 セクター比較":           page_sector_comparison,
+    "📊 センチメント推移":       page_sentiment_chart,
 }
 PAGE_MAP[page_sel]()
 
