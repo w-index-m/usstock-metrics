@@ -1109,6 +1109,90 @@ def calc_momentum_scores(tickers: tuple, workers: int = 15) -> pd.DataFrame:
 
 
 # =============================================================
+# セクター比較
+# =============================================================
+OPTICAL_TICKERS = ["CIEN", "COHR", "LITE", "VIAV", "AAOI"]
+SEMI_TICKERS    = ["NVDA", "AMD", "AVGO", "INTC", "QCOM"]
+SEMI_ETF        = ["SMH", "SOXX"]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_normalized_prices(tickers: tuple, days: int = 365) -> pd.DataFrame:
+    """複数ティッカーの終値を取得し、始値=100に正規化したDataFrameを返す"""
+    def _fetch(t: str):
+        ohlcv = get_ohlcv_data(t, days + 10)
+        return t, ohlcv["Close"] if not ohlcv.empty else None
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        for t, s in [f.result() for f in concurrent.futures.as_completed(
+            {ex.submit(_fetch, t): t for t in tickers}
+        )]:
+            if s is not None:
+                results[t] = s
+
+    if not results:
+        return pd.DataFrame()
+    df = pd.DataFrame(results).sort_index().ffill()
+    first_valid = df.dropna(how="any").index
+    if first_valid.empty:
+        return pd.DataFrame()
+    df = df.loc[first_valid[0]:]
+    return (df / df.iloc[0] * 100).round(2)
+
+
+# =============================================================
+# センチメント履歴
+# =============================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def calc_sentiment_history(index_ticker: str = "^NDX", days: int = 365) -> pd.DataFrame:
+    """RSI / MACD / VIX / モメンタム / SMA50 から日次センチメントスコアを計算"""
+    ohlcv     = get_ohlcv_data(index_ticker, days + 60)
+    vix_ohlcv = get_ohlcv_data("^VIX", days + 60)
+    if ohlcv.empty:
+        return pd.DataFrame()
+
+    close = ohlcv["Close"]
+
+    # RSI スコア（±2）
+    rsi    = calc_rsi(close)
+    rsi_sc = pd.Series(0.0, index=rsi.index)
+    rsi_sc[rsi > 78] = -2; rsi_sc[(rsi > 70) & (rsi <= 78)] = -1
+    rsi_sc[rsi < 22]  =  2; rsi_sc[(rsi < 30) & (rsi >= 22)] = 1
+
+    # MACD スコア（±1）
+    _, _, hist = calc_macd(close)
+    macd_sc = hist.apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
+
+    # 5日モメンタム スコア（±2）
+    ret5   = close.pct_change(5) * 100
+    mom_sc = pd.Series(0.0, index=ret5.index)
+    mom_sc[ret5 > 2]   =  2; mom_sc[(ret5 > 0.5)  & (ret5 <= 2)]    = 1
+    mom_sc[ret5 < -2]  = -2; mom_sc[(ret5 < -0.5) & (ret5 >= -2)]   = -1
+
+    # SMA50 スコア（±1）
+    sma50_sc = (close > close.rolling(50).mean()).map({True: 1.0, False: -1.0})
+
+    # VIX スコア（±2）
+    vix_sc = pd.Series(0.0, index=close.index)
+    if not vix_ohlcv.empty:
+        vix = vix_ohlcv["Close"].reindex(close.index, method="ffill")
+        vix_sc[vix < 14]  =  2; vix_sc[(vix >= 14) & (vix < 18)]  = 1
+        vix_sc[vix >= 30] = -2; vix_sc[(vix >= 23) & (vix < 30)]  = -1
+
+    total = (rsi_sc + macd_sc + mom_sc + sma50_sc + vix_sc).rolling(5).mean()
+
+    return pd.DataFrame({
+        "指数価格":            close,
+        "センチメントスコア":  total,
+        "RSI貢献":             rsi_sc.rolling(5).mean(),
+        "MACD貢献":            macd_sc.rolling(5).mean(),
+        "モメンタム貢献":      mom_sc.rolling(5).mean(),
+        "VIX貢献":             vix_sc.rolling(5).mean(),
+        "SMA50貢献":           sma50_sc.rolling(5).mean(),
+    }).dropna().tail(days)
+
+
+# =============================================================
 # Page functions
 # =============================================================
 
@@ -1526,6 +1610,202 @@ def page_momentum():
     st.plotly_chart(fig, use_container_width=True)
 
 
+def page_sector_comparison():
+    st.title("📡 セクター比較チャート")
+    st.caption("光通信 vs 半導体バスケット / 期間正規化リターン比較（始値=100）")
+
+    period_map = {"3ヶ月": 90, "6ヶ月": 180, "1年": 365, "2年": 730, "3年": 1095}
+
+    with st.sidebar:
+        st.header("設定")
+        period        = st.selectbox("期間", list(period_map.keys()), index=2)
+        show_indiv    = st.checkbox("個別銘柄を表示（凡例でON/OFF）", value=True)
+        custom_tickers = st.multiselect("追加比較銘柄", nasdaq100_tickers, default=[])
+
+    # バスケット構成を表示
+    with st.expander("📋 バスケット構成"):
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.markdown("**📡 光通信バスケット（等加重）**")
+            for t in OPTICAL_TICKERS: st.markdown(f"- `{t}`")
+        with bc2:
+            st.markdown("**💾 半導体バスケット（等加重）**")
+            for t in SEMI_TICKERS:  st.markdown(f"- `{t}`")
+            for t in SEMI_ETF:      st.markdown(f"- `{t}` *(ETF)*")
+
+    if not st.button("▶ 比較チャートを表示", type="primary"):
+        return
+
+    all_t = list(dict.fromkeys(OPTICAL_TICKERS + SEMI_TICKERS + SEMI_ETF + ["^NDX"] + custom_tickers))
+    with st.spinner(f"価格データ取得中（{len(all_t)} 銘柄）..."):
+        norm_df = get_normalized_prices(tuple(all_t), period_map[period])
+
+    if norm_df.empty:
+        st.error("データの取得に失敗しました。"); return
+
+    # バスケット計算
+    opt_cols  = [t for t in OPTICAL_TICKERS if t in norm_df.columns]
+    semi_cols = [t for t in SEMI_TICKERS    if t in norm_df.columns]
+    if opt_cols:  norm_df["📡 光通信（等加重）"] = norm_df[opt_cols].mean(axis=1)
+    if semi_cols: norm_df["💾 半導体（等加重）"] = norm_df[semi_cols].mean(axis=1)
+
+    # Plotly チャート
+    fig = go.Figure()
+
+    # バスケット（太線）
+    for name, color in [("📡 光通信（等加重）","#FF6B35"), ("💾 半導体（等加重）","#42A5F5")]:
+        if name in norm_df.columns:
+            fig.add_scatter(x=norm_df.index, y=norm_df[name], name=name,
+                            line=dict(color=color, width=3))
+
+    # ベンチマーク
+    if "^NDX" in norm_df.columns:
+        fig.add_scatter(x=norm_df.index, y=norm_df["^NDX"], name="NASDAQ 100",
+                        line=dict(color="#CCCCCC", width=1.5, dash="dot"))
+
+    # ETF
+    for t, color in [("SMH","#FFA726"), ("SOXX","#AB47BC")]:
+        if t in norm_df.columns:
+            fig.add_scatter(x=norm_df.index, y=norm_df[t], name=t,
+                            line=dict(color=color, width=2, dash="dash"))
+
+    # 個別銘柄（凡例ONのみ表示）
+    if show_indiv:
+        opt_colors  = ["#FF8C5A","#FFA87A","#FFC49A","#FFD9B3","#FFF0E0"]
+        semi_colors = ["#64B5F6","#90CAF9","#BBDEFB","#C5E3F7","#E3F2FD"]
+        for t, c in zip(opt_cols, opt_colors):
+            fig.add_scatter(x=norm_df.index, y=norm_df[t], name=t,
+                            line=dict(color=c, width=1, dash="dot"), visible="legendonly")
+        for t, c in zip(semi_cols, semi_colors):
+            fig.add_scatter(x=norm_df.index, y=norm_df[t], name=t,
+                            line=dict(color=c, width=1, dash="dot"), visible="legendonly")
+
+    # カスタム銘柄
+    for t in custom_tickers:
+        if t in norm_df.columns:
+            fig.add_scatter(x=norm_df.index, y=norm_df[t], name=f"★ {t}",
+                            line=dict(width=2))
+
+    fig.add_hline(y=100, line_dash="dot", line_color="rgba(255,255,255,0.25)")
+    fig.update_layout(
+        title=f"正規化価格比較（{period} / 始値 = 100）",
+        template="plotly_dark", height=560,
+        legend=dict(orientation="h", y=-0.25, x=0),
+        yaxis_title="価格（始値=100）",
+        margin=dict(l=50, r=20, t=60, b=120),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 期間リターン表
+    st.markdown("#### 期間リターン一覧")
+    ret_rows = []
+    groups = [
+        ("バスケット",    ["📡 光通信（等加重）","💾 半導体（等加重）"]),
+        ("ETF",           SEMI_ETF),
+        ("光通信 個別",   opt_cols),
+        ("半導体 個別",   semi_cols),
+        ("ベンチマーク",  ["^NDX"]),
+        ("カスタム",      [t for t in custom_tickers if t in norm_df.columns]),
+    ]
+    for grp, tlist in groups:
+        for t in tlist:
+            if t in norm_df.columns:
+                ret_rows.append({"グループ": grp, "銘柄/バスケット": t,
+                                 "期間リターン(%)": norm_df[t].iloc[-1] - 100})
+    if ret_rows:
+        rdf = pd.DataFrame(ret_rows).sort_values("期間リターン(%)", ascending=False)
+        st.dataframe(
+            rdf.style.format("{:+.1f}%", subset=["期間リターン(%)"])
+                     .background_gradient(subset=["期間リターン(%)"], cmap="RdYlGn", vmin=-50, vmax=200),
+            use_container_width=True, hide_index=True,
+        )
+
+
+def page_sentiment_chart():
+    st.title("📊 センチメント推移チャート")
+    st.caption("テクニカル複合センチメント（RSI / MACD / VIX / モメンタム / SMA50）vs 指数価格")
+
+    with st.sidebar:
+        st.header("設定")
+        index_choice = st.selectbox("対象指数",
+                                     ["NASDAQ 100 (^NDX)", "S&P 500 (^GSPC)", "Dow Jones (^DJI)"])
+        period_label = st.selectbox("期間", ["3ヶ月", "6ヶ月", "1年"], index=2)
+
+    ticker_map = {
+        "NASDAQ 100 (^NDX)": "^NDX",
+        "S&P 500 (^GSPC)":   "^GSPC",
+        "Dow Jones (^DJI)":  "^DJI",
+    }
+    days_map = {"3ヶ月": 90, "6ヶ月": 180, "1年": 365}
+
+    with st.spinner("センチメント履歴を計算中..."):
+        hist_df = calc_sentiment_history(ticker_map[index_choice], days_map[period_label])
+
+    if hist_df.empty:
+        st.error("データの取得に失敗しました。"); return
+
+    # ── デュアル軸チャート ─────────────────────────────────────
+    from plotly.subplots import make_subplots as _msp
+    fig = _msp(specs=[[{"secondary_y": True}]])
+
+    score  = hist_df["センチメントスコア"]
+    bar_colors = ["#26A69A" if v >= 0 else "#EF5350" for v in score]
+    fig.add_bar(x=hist_df.index, y=score, name="センチメントスコア",
+                marker_color=bar_colors, opacity=0.7, secondary_y=False)
+    fig.add_scatter(x=hist_df.index, y=hist_df["指数価格"],
+                    name=index_choice.split("(")[0].strip(),
+                    line=dict(color="#FFFFFF", width=2), secondary_y=True)
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.3)", secondary_y=False)
+
+    fig.update_layout(
+        title=f"テクニカルセンチメント vs {index_choice}（{period_label} / 5日移動平均）",
+        template="plotly_dark", height=500,
+        legend=dict(orientation="h", y=1.05, x=0),
+        margin=dict(l=60, r=60, t=60, b=20),
+    )
+    fig.update_yaxes(title_text="センチメントスコア（±7）", secondary_y=False)
+    fig.update_yaxes(title_text="指数価格", secondary_y=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── ファクター別貢献チャート ──────────────────────────────
+    st.markdown("#### ファクター別貢献度（5日移動平均）")
+    factor_cols = ["RSI貢献","MACD貢献","モメンタム貢献","VIX貢献","SMA50貢献"]
+    avail = [c for c in factor_cols if c in hist_df.columns]
+    if avail:
+        fig2 = go.Figure()
+        colors_f = ["#AB47BC","#42A5F5","#FFA726","#26A69A","#EC407A"]
+        for col, color in zip(avail, colors_f):
+            fig2.add_scatter(x=hist_df.index, y=hist_df[col], name=col,
+                             line=dict(color=color, width=1.3))
+        fig2.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
+        fig2.update_layout(template="plotly_dark", height=280,
+                           legend=dict(orientation="h", y=1.05, x=0),
+                           margin=dict(l=50, r=20, t=30, b=20))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── 直近メトリクス ────────────────────────────────────────
+    st.markdown("#### 直近センチメント状況")
+    latest = hist_df.iloc[-1]
+    mc = st.columns(5)
+    for col, key in zip(mc, ["センチメントスコア","RSI貢献","MACD貢献","VIX貢献","モメンタム貢献"]):
+        val = latest.get(key, 0)
+        col.metric(key, f"{val:.2f}")
+
+    # ── スコア判定凡例 ────────────────────────────────────────
+    with st.expander("📖 スコア判定基準"):
+        st.markdown("""
+| スコア | 判定 |
+|--------|------|
+| +7 以上 | 🟢 強気 |
+| +3 〜 +6 | 🟡 やや強気 |
+| -2 〜 +2 | ⚪ 中立 |
+| -6 〜 -3 | 🟠 やや弱気 |
+| -7 以下 | 🔴 弱気 |
+
+**ファクター構成**: RSI(±2) + MACD(±1) + 5日モメンタム(±2) + SMA50(±1) + VIX(±2) = 最大 ±8
+""")
+
+
 # =============================================================
 # Navigation（サイドバー）
 # =============================================================
@@ -1538,7 +1818,9 @@ with st.sidebar:
          "📉 テクニカル分析",
          "📋 決算分析",
          "📰 ニュース翻訳",
-         "🚀 モメンタムランキング"],
+         "🚀 モメンタムランキング",
+         "📡 セクター比較",
+         "📊 センチメント推移"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -1556,6 +1838,8 @@ PAGE_MAP = {
     "📋 決算分析":             page_earnings,
     "📰 ニュース翻訳":         page_news,
     "🚀 モメンタムランキング": page_momentum,
+    "📡 セクター比較":         page_sector_comparison,
+    "📊 センチメント推移":     page_sentiment_chart,
 }
 PAGE_MAP[page_sel]()
 
