@@ -27,6 +27,8 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 import xml.etree.ElementTree as ET
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 try:
     import google.generativeai as genai
@@ -576,6 +578,170 @@ def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
     except Exception:
         return []
 
+# ── リアルタイム株価クォート ──────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_quote_data(tickers: tuple) -> pd.DataFrame:
+    """Yahoo Finance v7 から現在値・前日比を取得（TTL 60秒）"""
+    try:
+        symbols = ",".join(tickers)
+        url = (
+            f"https://query2.finance.yahoo.com/v7/finance/quote"
+            f"?symbols={symbols}"
+            f"&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,shortName"
+        )
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(5, 10))
+        if r.status_code != 200:
+            return pd.DataFrame()
+        results = r.json().get("quoteResponse", {}).get("result", [])
+        rows = []
+        for q in results:
+            rows.append({
+                "シンボル": q.get("symbol", ""),
+                "名称": (q.get("shortName") or "")[:25],
+                "現在値": q.get("regularMarketPrice"),
+                "前日比": q.get("regularMarketChange"),
+                "前日比%": q.get("regularMarketChangePercent"),
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ohlcv_data(ticker: str, days: int = 365) -> pd.DataFrame:
+    """Yahoo Finance v8 から OHLCV データを取得"""
+    try:
+        end_ts   = int(datetime.today().timestamp())
+        start_ts = int((datetime.today() - timedelta(days=days)).timestamp())
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+            f"?interval=1d&period1={start_ts}&period2={end_ts}"
+        )
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(5, 10))
+        if r.status_code != 200:
+            return pd.DataFrame()
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return pd.DataFrame()
+        timestamps = result[0].get("timestamp", [])
+        quotes     = result[0].get("indicators", {}).get("quote", [{}])[0]
+        dates      = pd.to_datetime(timestamps, unit="s").normalize()
+        df = pd.DataFrame({
+            "Open":   quotes.get("open",   []),
+            "High":   quotes.get("high",   []),
+            "Low":    quotes.get("low",    []),
+            "Close":  quotes.get("close",  []),
+            "Volume": quotes.get("volume", []),
+        }, index=dates)
+        return df.dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+
+# ── テクニカル指標 ────────────────────────────────────────────
+
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast    = series.ewm(span=fast,   adjust=False).mean()
+    ema_slow    = series.ewm(span=slow,   adjust=False).mean()
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def build_tech_chart(df: pd.DataFrame, ticker: str):
+    """Plotly でテクニカル分析チャート（ローソク足+MA / 出来高 / RSI / MACD）"""
+    close  = df["Close"]
+    sma20  = close.rolling(20).mean()
+    sma50  = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    rsi    = calc_rsi(close)
+    macd_l, sig_l, hist = calc_macd(close)
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.50, 0.15, 0.175, 0.175],
+        vertical_spacing=0.03,
+        subplot_titles=[
+            f"{ticker}  株価 + 移動平均", "出来高", "RSI (14)", "MACD (12,26,9)",
+        ],
+    )
+
+    # Row 1: ローソク足 + SMA
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=close,
+        name="OHLC",
+        increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+        showlegend=False,
+    ), row=1, col=1)
+    for sma, color, name in [
+        (sma20,  "#FFA726", "SMA 20"),
+        (sma50,  "#42A5F5", "SMA 50"),
+        (sma200, "#EC407A", "SMA 200"),
+    ]:
+        if sma.notna().sum() > 0:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=sma, name=name,
+                line=dict(color=color, width=1.3),
+            ), row=1, col=1)
+
+    # Row 2: 出来高
+    vol_colors = [
+        "#26A69A" if c >= o else "#EF5350"
+        for c, o in zip(df["Close"], df["Open"])
+    ]
+    fig.add_trace(go.Bar(
+        x=df.index, y=df["Volume"], name="出来高",
+        marker_color=vol_colors, showlegend=False,
+    ), row=2, col=1)
+
+    # Row 3: RSI
+    fig.add_trace(go.Scatter(
+        x=df.index, y=rsi, name="RSI",
+        line=dict(color="#AB47BC", width=1.5),
+    ), row=3, col=1)
+    for level, color in [
+        (70, "rgba(239,83,80,0.5)"),
+        (50, "rgba(255,255,255,0.2)"),
+        (30, "rgba(38,166,154,0.5)"),
+    ]:
+        fig.add_hline(y=level, line_dash="dash", line_color=color, row=3, col=1)
+
+    # Row 4: MACD
+    hist_colors = ["#26A69A" if v >= 0 else "#EF5350" for v in hist.fillna(0)]
+    fig.add_trace(go.Bar(
+        x=df.index, y=hist, name="ヒストグラム",
+        marker_color=hist_colors, showlegend=False,
+    ), row=4, col=1)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=macd_l, name="MACD",
+        line=dict(color="#42A5F5", width=1.3),
+    ), row=4, col=1)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=sig_l, name="シグナル",
+        line=dict(color="#FFA726", width=1.3),
+    ), row=4, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.25)", row=4, col=1)
+
+    fig.update_layout(
+        height=820, template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        margin=dict(l=50, r=20, t=60, b=20),
+    )
+    return fig
+
+
 # ── メール通知 ────────────────────────────────────────────────
 
 def send_email_notification(subject, body, attachment_bytes=None, filename="report.txt"):
@@ -673,7 +839,22 @@ with st.expander("🤖 AI プロバイダー状態", expanded=False):
     if not any([GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY]):
         st.warning("⚠️ AI APIキーが未設定です")
 
-tab1, tab2, tab3 = st.tabs(["📊 パフォーマンス分析", "📋 決算分析（EDGAR・EPS）", "📰 ニュース翻訳・センチメント"])
+MARKET_INDICES = [
+    ("^GSPC", "S&P 500"), ("^NDX", "NASDAQ 100"),
+    ("^DJI", "ダウ平均"), ("^RUT", "Russell 2000"),
+]
+MARKET_MACRO = [
+    ("^VIX", "VIX（恐怖指数）"), ("^TNX", "米10年債利回り(%)"),
+    ("GC=F", "金 ($/oz)"), ("CL=F", "WTI原油 ($/bbl)"), ("DX-Y.NYB", "ドル指数 (DXY)"),
+]
+
+tab_market, tab_perf, tab_tech, tab_earnings, tab_news = st.tabs([
+    "📈 マーケット概況",
+    "📊 パフォーマンス分析",
+    "📉 テクニカル分析",
+    "📋 決算分析（EDGAR・EPS）",
+    "📰 ニュース翻訳・センチメント",
+])
 
 # ── サイドバー ────────────────────────────────────────────────
 with st.sidebar:
@@ -703,9 +884,65 @@ end_date   = datetime.today().date()
 start_date = end_date - timedelta(days=years * 365)
 
 # =============================================================
+# Tab 0: マーケット概況
+# =============================================================
+with tab_market:
+    st.subheader("📈 マーケット概況")
+
+    refresh_col, _ = st.columns([1, 5])
+    if refresh_col.button("🔄 データ更新", key="refresh_mkt"):
+        st.cache_data.clear()
+        st.rerun()
+
+    all_mkt_tickers = tuple(t for t, _ in MARKET_INDICES + MARKET_MACRO)
+    with st.spinner("市場データ取得中..."):
+        mkt_df = get_quote_data(all_mkt_tickers)
+
+    if not mkt_df.empty:
+        st.markdown("#### 主要指数")
+        idx_cols = st.columns(4)
+        for col, (sym, label) in zip(idx_cols, MARKET_INDICES):
+            row = mkt_df[mkt_df["シンボル"] == sym]
+            if not row.empty and pd.notna(row.iloc[0]["現在値"]):
+                price = row.iloc[0]["現在値"]
+                chgp  = row.iloc[0]["前日比%"]
+                col.metric(label, f"{price:,.2f}", f"{chgp:+.2f}%" if pd.notna(chgp) else None)
+
+        st.markdown("#### マクロ経済指標")
+        mac_cols = st.columns(5)
+        for col, (sym, label) in zip(mac_cols, MARKET_MACRO):
+            row = mkt_df[mkt_df["シンボル"] == sym]
+            if not row.empty and pd.notna(row.iloc[0]["現在値"]):
+                price = row.iloc[0]["現在値"]
+                chgp  = row.iloc[0]["前日比%"]
+                col.metric(label, f"{price:.2f}", f"{chgp:+.2f}%" if pd.notna(chgp) else None,
+                           delta_color="inverse" if sym == "^VIX" else "normal")
+    else:
+        st.warning("市場データの取得に失敗しました。しばらくしてから更新ボタンを押してください。")
+
+    st.divider()
+    st.markdown("#### 個別銘柄 リアルタイム株価")
+    rt_tickers = st.multiselect(
+        "銘柄を選択（最大20銘柄）",
+        nasdaq100_tickers,
+        default=["AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN"],
+        max_selections=20,
+        key="rt_tickers",
+    )
+    if rt_tickers:
+        with st.spinner("株価データ取得中..."):
+            rt_df = get_quote_data(tuple(rt_tickers))
+        if not rt_df.empty:
+            disp = rt_df.copy()
+            disp["現在値"] = disp["現在値"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+            disp["前日比"]  = disp["前日比"].apply(lambda x: f"{x:+.2f}" if pd.notna(x) else "N/A")
+            disp["前日比%"] = disp["前日比%"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+# =============================================================
 # Tab 1: パフォーマンス分析
 # =============================================================
-with tab1:
+with tab_perf:
     st.subheader("📊 NASDAQ-100 パフォーマンス分析")
     st.caption("📡 株価データ: Tiingo → Stooq → Yahoo Finance の順で自動フォールバック")
 
@@ -797,9 +1034,60 @@ with tab1:
                                    file_name=f"Nasdaq100_Analysis_{end_date}.xlsx")
 
 # =============================================================
-# Tab 2: 決算分析
+# Tab 2: テクニカル分析
 # =============================================================
-with tab2:
+with tab_tech:
+    st.subheader("📉 テクニカル分析チャート")
+
+    tc1, tc2 = st.columns([3, 1])
+    with tc1:
+        tech_ticker = st.selectbox(
+            "銘柄を選択",
+            nasdaq100_tickers,
+            index=nasdaq100_tickers.index("AAPL") if "AAPL" in nasdaq100_tickers else 0,
+            key="tech_ticker_sel",
+        )
+    with tc2:
+        period_label = st.selectbox(
+            "期間", ["3ヶ月", "6ヶ月", "1年", "2年", "3年"], index=2, key="tech_period_sel"
+        )
+
+    period_map = {"3ヶ月": 90, "6ヶ月": 180, "1年": 365, "2年": 730, "3年": 1095}
+
+    if st.button("▶ チャートを表示", type="primary", key="btn_tech"):
+        with st.spinner(f"📡 {tech_ticker} OHLCV データ取得中..."):
+            ohlcv = get_ohlcv_data(tech_ticker, period_map[period_label])
+
+        if ohlcv.empty:
+            st.error("データの取得に失敗しました。しばらくしてから再試行してください。")
+        else:
+            st.plotly_chart(build_tech_chart(ohlcv, tech_ticker), use_container_width=True)
+
+            # 直近のテクニカルシグナル
+            close    = ohlcv["Close"]
+            rsi_now  = calc_rsi(close).iloc[-1]
+            macd_l, _, hist = calc_macd(close)
+
+            sig_cols = st.columns(3)
+            rsi_status = "🔴 買われすぎ" if rsi_now > 70 else "🟢 売られすぎ" if rsi_now < 30 else "⚪ 中立"
+            sig_cols[0].metric("RSI (14)", f"{rsi_now:.1f}", rsi_status, delta_color="off")
+
+            macd_signal = (
+                "🟢 ゴールデンクロス" if hist.iloc[-1] > 0 and hist.iloc[-2] <= 0 else
+                "🔴 デッドクロス"     if hist.iloc[-1] < 0 and hist.iloc[-2] >= 0 else
+                "↑ 強気"             if hist.iloc[-1] > 0 else "↓ 弱気"
+            )
+            sig_cols[1].metric("MACD", f"{macd_l.iloc[-1]:.3f}", macd_signal, delta_color="off")
+
+            sma50 = close.rolling(50).mean().iloc[-1]
+            vs_sma = "↑ SMA50 上回り" if close.iloc[-1] > sma50 else "↓ SMA50 下回り"
+            sig_cols[2].metric("現在値 vs SMA50", f"${close.iloc[-1]:.2f}", vs_sma,
+                               delta_color="normal" if close.iloc[-1] > sma50 else "inverse")
+
+# =============================================================
+# Tab 3: 決算分析
+# =============================================================
+with tab_earnings:
     st.subheader("📋 決算分析（SEC EDGAR + Yahoo Finance）")
     if not selected_tickers:
         st.info("サイドバーで銘柄を選択してください")
@@ -901,9 +1189,9 @@ with tab2:
                 st.success(f"✅ {msg}") if ok else st.warning(f"⚠️ {msg}")
 
 # =============================================================
-# Tab 3: ニュース翻訳・センチメント
+# Tab 4: ニュース翻訳・センチメント
 # =============================================================
-with tab3:
+with tab_news:
     st.subheader("📰 最新ニュース 自動日本語翻訳・センチメント分析")
     news_ticker = st.selectbox(
         "銘柄を選択", nasdaq100_tickers,
