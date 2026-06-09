@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from datetime import datetime, timedelta
 import concurrent.futures
-import os, io, json, time, smtplib
+import os, io, json, time, smtplib, re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -181,6 +181,41 @@ def call_ai(prompt: str) -> str:
 
 
 # ── AI キャッシュ付きラッパー ──────────────────────────────────
+
+def _strip_html(text: str) -> str:
+    return re.sub(r'<[^>]+>', ' ', text).strip()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def ai_translate_titles(titles_tuple: tuple) -> dict:
+    """英語見出し一覧を一括翻訳して {英語: 日本語} を返す"""
+    if not titles_tuple:
+        return {}
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles_tuple))
+    raw = call_ai(
+        "以下の英語ニュース見出しを日本語に翻訳してください。\n"
+        "必ず「番号. 翻訳文」の形式のみで返してください（説明・コメント不要）。\n\n"
+        + numbered
+    )
+    result = {}
+    for line in raw.splitlines():
+        m = re.match(r'^(\d+)[.)]\s*(.+)', line.strip())
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(titles_tuple):
+                result[titles_tuple[idx]] = m.group(2).strip()
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def ai_translate_description(text: str) -> str:
+    """RSS 記事概要を日本語に翻訳（200文字以内）"""
+    if not text:
+        return ""
+    return call_ai(
+        f"以下の英語テキストを自然な日本語に翻訳してください（200文字以内）:\n\n{text[:800]}"
+    )
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def ai_translate_and_summarize(text: str, context: str = "") -> str:
@@ -582,14 +617,15 @@ def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
 
 # (name, url, category)  category: "market" | "tech"
 _NEWS_SOURCES = [
-    ("Yahoo Finance",  "https://finance.yahoo.com/rss/topstories",                       "market"),
-    ("MarketWatch",    "https://feeds.marketwatch.com/marketwatch/topstories/",          "market"),
-    ("MarketWatch MP", "https://feeds.marketwatch.com/marketwatch/marketpulse/",         "market"),
-    ("Investing.com",  "https://www.investing.com/rss/news_25.rss",                      "market"),
-    ("TechCrunch",     "https://techcrunch.com/feed/",                                   "tech"),
-    ("The Verge",      "https://www.theverge.com/rss/index.xml",                         "tech"),
-    ("CNBC Tech",      "https://www.cnbc.com/id/19854910/device/rss/rss.html",           "tech"),
-    ("Reuters Tech",   "https://feeds.reuters.com/reuters/technologyNews",               "tech"),
+    ("Yahoo Finance",   "https://finance.yahoo.com/rss/topstories",                        "market"),
+    ("MarketWatch",     "https://feeds.marketwatch.com/marketwatch/topstories/",           "market"),
+    ("MarketWatch MP",  "https://feeds.marketwatch.com/marketwatch/marketpulse/",          "market"),
+    ("Investing.com",   "https://www.investing.com/rss/news_25.rss",                       "market"),
+    ("Reuters Biz",     "https://feeds.reuters.com/reuters/businessNews",                  "market"),
+    ("TechCrunch",      "https://techcrunch.com/feed/",                                    "tech"),
+    ("The Verge",       "https://www.theverge.com/rss/index.xml",                          "tech"),
+    ("CNBC Tech",       "https://www.cnbc.com/id/19854910/device/rss/rss.html",            "tech"),
+    ("Reuters Tech",    "https://feeds.reuters.com/reuters/technologyNews",                "tech"),
 ]
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -612,12 +648,15 @@ def get_market_news(max_per_source: int = 12) -> list[dict]:
                 pub_el   = item.find("pubDate")
                 if not (title_el is not None and title_el.text):
                     continue
+                desc_el  = item.find("description")
+                desc_raw = (desc_el.text or "") if desc_el is not None else ""
                 items.append({
                     "カテゴリ": category,
                     "ソース":   name,
                     "見出し":   title_el.text.strip(),
                     "リンク":   (link_el.text or "").strip() if link_el is not None else "",
                     "日時":     (pub_el.text or "")[:22] if pub_el is not None else "",
+                    "概要":     _strip_html(desc_raw)[:500],
                 })
                 if len(items) >= max_per_source:
                     break
@@ -999,27 +1038,39 @@ with tab_market:
     with st.spinner("ニュース取得中（全ソース並列）..."):
         mkt_news = get_market_news()
 
-    def _render_news_tabs(items: list[dict], ai_key: str, ai_context: str) -> None:
+    def _render_news_tabs(items: list[dict], ai_key: str) -> None:
         if not items:
             st.info("取得できませんでした。しばらくしてから更新ボタンを押してください。")
             return
+
+        # タイトル一括翻訳（キャッシュ済みなら即表示）
+        with st.spinner("タイトル翻訳中..."):
+            title_map = ai_translate_titles(tuple(item["見出し"] for item in items))
+
         sources = list(dict.fromkeys(item["ソース"] for item in items))
         ntabs = st.tabs(sources)
         for ntab, src in zip(ntabs, sources):
             with ntab:
-                for item in [i for i in items if i["ソース"] == src]:
-                    date_str = f" `{item['日時']}`" if item["日時"] else ""
+                for idx, item in enumerate(i for i in items if i["ソース"] == src):
+                    orig = item["見出し"]
+                    ja   = title_map.get(orig, orig)
+                    date_str = f"  `{item['日時']}`" if item["日時"] else ""
+
                     if item["リンク"]:
-                        st.markdown(f"- [{item['見出し']}]({item['リンク']}){date_str}")
+                        st.markdown(f"**[{ja}]({item['リンク']})**{date_str}")
                     else:
-                        st.markdown(f"- {item['見出し']}{date_str}")
-        if st.button("🤖 AI で日本語要約", key=ai_key):
-            with st.spinner("AI 翻訳・要約中..."):
-                summary = ai_translate_and_summarize(
-                    "\n".join(item["見出し"] for item in items[:20]),
-                    context=ai_context,
-                )
-            st.info(summary)
+                        st.markdown(f"**{ja}**{date_str}")
+                    st.caption(f"🔤 {orig}")
+
+                    desc = item.get("概要", "")
+                    if desc:
+                        with st.expander("📄 記事概要を翻訳"):
+                            st.caption(desc)
+                            if st.button("🤖 日本語に翻訳", key=f"desc_{ai_key}_{src}_{idx}"):
+                                with st.spinner("翻訳中..."):
+                                    desc_ja = ai_translate_description(desc)
+                                st.info(desc_ja)
+                    st.markdown("---")
 
     market_items = [i for i in mkt_news if i["カテゴリ"] == "market"]
     tech_items   = [i for i in mkt_news if i["カテゴリ"] == "tech"]
@@ -1027,10 +1078,10 @@ with tab_market:
     col_m, col_t = st.columns(2)
     with col_m:
         st.markdown("**📊 市場全般**")
-        _render_news_tabs(market_items, "ai_market_news", "米国株市場の最新ニュース（Yahoo Finance / MarketWatch / Investing.com）")
+        _render_news_tabs(market_items, "market")
     with col_t:
         st.markdown("**💻 ハイテク系**")
-        _render_news_tabs(tech_items,  "ai_tech_news",   "米国ハイテク株・テクノロジー業界の最新ニュース（TechCrunch / The Verge / CNBC Tech / Reuters Tech）")
+        _render_news_tabs(tech_items, "tech")
 
 # =============================================================
 # Tab 1: パフォーマンス分析
