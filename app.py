@@ -578,6 +578,55 @@ def get_news_headlines(ticker: str, max_items: int = 10) -> list[str]:
     except Exception:
         return []
 
+# ── 市場ニュース（複数RSS並列取得）──────────────────────────────
+
+_NEWS_SOURCES = [
+    ("Yahoo Finance",  "https://finance.yahoo.com/rss/topstories"),
+    ("MarketWatch",    "https://feeds.marketwatch.com/marketwatch/topstories/"),
+    ("MarketWatch MP", "https://feeds.marketwatch.com/marketwatch/marketpulse/"),
+    ("Investing.com",  "https://www.investing.com/rss/news_25.rss"),
+]
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_market_news(max_per_source: int = 12) -> list[dict]:
+    """複数 RSS から米国株市場ニュースを並列取得"""
+
+    def _fetch(name: str, url: str) -> list[dict]:
+        try:
+            r = requests.get(
+                url, timeout=(4, 8),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            if r.status_code != 200:
+                return []
+            root  = ET.fromstring(r.content)
+            items = []
+            for item in root.findall(".//item"):
+                title_el = item.find("title")
+                link_el  = item.find("link")
+                pub_el   = item.find("pubDate")
+                if not (title_el is not None and title_el.text):
+                    continue
+                items.append({
+                    "ソース":  name,
+                    "見出し":  title_el.text.strip(),
+                    "リンク":  (link_el.text or "").strip() if link_el is not None else "",
+                    "日時":    (pub_el.text or "")[:22] if pub_el is not None else "",
+                })
+                if len(items) >= max_per_source:
+                    break
+            return items
+        except Exception:
+            return []
+
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(_NEWS_SOURCES)) as ex:
+        futures = {ex.submit(_fetch, name, url): name for name, url in _NEWS_SOURCES}
+        for f in concurrent.futures.as_completed(futures):
+            results.extend(f.result())
+    return results
+
+
 # ── リアルタイム株価クォート ──────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -938,6 +987,38 @@ with tab_market:
             disp["前日比"]  = disp["前日比"].apply(lambda x: f"{x:+.2f}" if pd.notna(x) else "N/A")
             disp["前日比%"] = disp["前日比%"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A")
             st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 📰 最新 米国株市場ニュース")
+    with st.spinner("ニュース取得中..."):
+        mkt_news = get_market_news()
+
+    if mkt_news:
+        # ソース別タブ表示
+        available_sources = list(dict.fromkeys(item["ソース"] for item in mkt_news))
+        news_tabs = st.tabs(available_sources)
+        for ntab, src in zip(news_tabs, available_sources):
+            with ntab:
+                src_items = [item for item in mkt_news if item["ソース"] == src]
+                for item in src_items:
+                    headline = item["見出し"]
+                    date_str = f" `{item['日時']}`" if item["日時"] else ""
+                    if item["リンク"]:
+                        st.markdown(f"- [{headline}]({item['リンク']}){date_str}")
+                    else:
+                        st.markdown(f"- {headline}{date_str}")
+
+        # AI 翻訳ボタン
+        if st.button("🤖 AI で市場ニュースを日本語要約", key="btn_translate_mkt_news"):
+            top_headlines = [item["見出し"] for item in mkt_news[:20]]
+            with st.spinner("AI 翻訳・要約中..."):
+                summary = ai_translate_and_summarize(
+                    "\n".join(top_headlines),
+                    context="米国株市場の最新ニュース一覧（Yahoo Finance / MarketWatch / Investing.com）",
+                )
+            st.info(summary)
+    else:
+        st.info("ニュースの取得に失敗しました。しばらくしてから更新ボタンを押してください。")
 
 # =============================================================
 # Tab 1: パフォーマンス分析
