@@ -48,7 +48,8 @@ else:
     plt.rcParams["font.sans-serif"] = ["IPAexGothic", "TakaoPGothic", "DejaVu Sans"]
 
 # ── ページ設定 ────────────────────────────────────────────────
-st.set_page_config(page_title="NASDAQ-100 プロ分析ツール", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="NASDAQ-100 プロ分析ツール", layout="wide", page_icon="🚀",
+                   initial_sidebar_state="expanded")
 
 # ── Secrets ───────────────────────────────────────────────────
 TIINGO_API_KEY     = st.secrets.get("TIINGO_API_KEY", "")
@@ -2130,7 +2131,7 @@ def page_market_screen():
 with st.sidebar:
     st.markdown("### 🚀 米国株ダッシュボード")
     page_sel = st.radio(
-        "ページ選択",
+        "📑 ページ選択",
         ["🖥️ マーケットスクリーン",
          "📈 マーケット概況",
          "📊 パフォーマンス分析",
@@ -2140,14 +2141,14 @@ with st.sidebar:
          "🚀 モメンタムランキング",
          "📡 セクター比較",
          "📊 センチメント推移"],
-        label_visibility="collapsed",
+        label_visibility="visible",
     )
     st.divider()
-    with st.expander("🤖 AI プロバイダー状態"):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Gemini",     "✅" if GEMINI_API_KEY     else "❌")
-        c2.metric("Groq",       "✅" if GROQ_API_KEY       else "❌")
-        c3.metric("OpenRouter", "✅" if OPENROUTER_API_KEY else "❌")
+    st.markdown("##### 🤖 AI プロバイダー状態")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Gemini",     "✅" if GEMINI_API_KEY     else "❌")
+    c2.metric("Groq",       "✅" if GROQ_API_KEY       else "❌")
+    c3.metric("OpenRouter", "✅" if OPENROUTER_API_KEY else "❌")
     st.caption("v3.0 | Tiingo / Stooq / Yahoo / SEC EDGAR")
 
 PAGE_MAP = {
