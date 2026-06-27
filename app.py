@@ -1925,7 +1925,7 @@ def page_market_screen():
 
             for ci, (ticker, name) in enumerate(row_items):
                 with cols[ci]:
-                    q     = quote_df[quote_df["シンボル"] == ticker]
+                    q     = quote_df[quote_df["シンボル"] == ticker] if "シンボル" in quote_df.columns else pd.DataFrame()
                     price = float(q.iloc[0]["現在値"])  if not q.empty and pd.notna(q.iloc[0]["現在値"])  else None
                     chg   = float(q.iloc[0]["前日比"])  if not q.empty and pd.notna(q.iloc[0]["前日比"])  else None
                     chgp  = float(q.iloc[0]["前日比%"]) if not q.empty and pd.notna(q.iloc[0]["前日比%"]) else None
