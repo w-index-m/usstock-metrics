@@ -2085,11 +2085,12 @@ def page_market_screen():
                                 key=f"spark_{ticker}",
                             )
 
-                    # ── カードフッター：現在値（大きく）+ 前日比絶対値 ──
+                    # ── カードフッター：現在値（大きく）+ 前日比絶対値 + 前日比% ──
                     st.markdown(
                         f"<div style='font-size:18px;font-weight:bold;color:var(--text-color);margin-top:2px'>"
                         f"{price_str}&nbsp;"
-                        f"<span style='font-size:13px;color:{color_hex}'>{chg_str}</span></div>",
+                        f"<span style='font-size:13px;color:{color_hex}'>{chg_str}"
+                        f"{(' (' + chgp_str + ')') if chgp is not None else ''}</span></div>",
                         unsafe_allow_html=True,
                     )
 
