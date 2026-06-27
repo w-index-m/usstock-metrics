@@ -2011,8 +2011,22 @@ def page_market_screen():
         sparklines = get_sparkline_data(all_tickers)
 
     if not quote_df.empty or intraday:
-        ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        col_ts.caption(f"最終取得: {ts} (UTC)")
+        jst_now = pd.Timestamp.now(tz="UTC").tz_convert("Asia/Tokyo")
+        # 実データの最新時刻（イントラデイの最後のタイムスタンプ＝米国東部時間）
+        data_ts = None
+        if intraday:
+            last_times = [d["prices"].index[-1] for d in intraday.values() if len(d["prices"]) > 0]
+            if last_times:
+                data_ts = max(last_times)
+        if data_ts is not None:
+            jst_str = data_ts.tz_convert("Asia/Tokyo").strftime("%m/%d %H:%M")
+            et_str  = data_ts.strftime("%m/%d %H:%M")
+            col_ts.caption(
+                f"📊 **株価データ時点: {jst_str}（日本時間）** / {et_str}（米国東部）　"
+                f"｜　取得: {jst_now.strftime('%H:%M')} 日本時間"
+            )
+        else:
+            col_ts.caption(f"取得: {jst_now.strftime('%Y-%m-%d %H:%M')}（日本時間）")
 
     for section_title, instruments in _SCREEN_SECTIONS:
         st.subheader(section_title)
