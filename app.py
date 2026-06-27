@@ -1127,7 +1127,7 @@ def get_sparkline_data(tickers: tuple) -> dict:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_intraday_data(tickers: tuple) -> dict:
-    """当日5分足の前日比(%)系列を並列取得して dict[ticker->Series] で返す"""
+    """当日5分足の価格系列と前日終値を並列取得して dict[ticker->{"prices":Series,"prev_close":float}] で返す"""
     def _fetch(ticker: str):
         try:
             url = (
@@ -1146,9 +1146,9 @@ def get_intraday_data(tickers: tuple) -> dict:
             closes     = data[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
             if not timestamps or not closes or not prev_close:
                 return ticker, None
-            times = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("America/New_York")
-            s = pd.Series(closes, index=times, dtype=float).dropna()
-            return ticker, (s / prev_close - 1) * 100
+            times  = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("America/New_York")
+            prices = pd.Series(closes, index=times, dtype=float).dropna()
+            return ticker, {"prices": prices, "prev_close": float(prev_close)}
         except Exception:
             return ticker, None
 
@@ -1157,7 +1157,7 @@ def get_intraday_data(tickers: tuple) -> dict:
         futures = {ex.submit(_fetch, t): t for t in tickers}
         for f in concurrent.futures.as_completed(futures):
             t, data = f.result()
-            if data is not None and len(data) > 0:
+            if data is not None and len(data["prices"]) > 0:
                 result[t] = data
     return result
 
@@ -1938,42 +1938,48 @@ def _make_sparkline_fig(closes: pd.Series, is_up: bool) -> "go.Figure":
     return fig
 
 
-def _make_intraday_fig(pct: pd.Series) -> "go.Figure":
-    """当日5分足の前日比(%)チャート。0以上は緑、0以下は赤で塗りつぶし"""
+def _make_intraday_fig(prices: pd.Series, prev_close: float) -> "go.Figure":
+    """当日5分足の価格チャート。±1%/±3%参照線付き、Y軸右側に価格表示"""
+    last = prices.iloc[-1]
+    color_line = "#26A69A" if last >= prev_close else "#EF5350"
+
     fig = go.Figure()
+
+    # ±1%, ±3% 水平参照線（シアン系）
+    for pct_level in [3, 1, -1, -3]:
+        level = prev_close * (1 + pct_level / 100)
+        clr   = "rgba(0,200,200,0.55)" if pct_level > 0 else "rgba(200,80,80,0.45)"
+        dash  = "dot" if abs(pct_level) == 1 else "dash"
+        fig.add_hline(
+            y=level, line_width=0.8, line_dash=dash, line_color=clr,
+            annotation_text=f"{pct_level:+d}%",
+            annotation_position="right",
+            annotation_font_size=8, annotation_font_color=clr,
+        )
+
+    # 前日終値ライン（白グレー）
+    fig.add_hline(y=prev_close, line_width=1, line_dash="solid",
+                  line_color="rgba(200,200,200,0.45)")
+
+    # 価格ライン
     fig.add_trace(go.Scatter(
-        x=pct.index, y=pct.clip(lower=0),
-        mode="lines", line=dict(width=0),
-        fill="tozeroy", fillcolor="rgba(38,166,154,0.25)",
-        showlegend=False, hoverinfo="skip",
-    ))
-    fig.add_trace(go.Scatter(
-        x=pct.index, y=pct.clip(upper=0),
-        mode="lines", line=dict(width=0),
-        fill="tozeroy", fillcolor="rgba(239,83,80,0.25)",
-        showlegend=False, hoverinfo="skip",
-    ))
-    last_color = "#26A69A" if (pct.iloc[-1] >= 0) else "#EF5350"
-    fig.add_trace(go.Scatter(
-        x=pct.index, y=pct.values,
-        mode="lines", line=dict(color=last_color, width=1.5),
+        x=prices.index, y=prices.values,
+        mode="lines", line=dict(color=color_line, width=1.5),
         showlegend=False,
-        hovertemplate="%{x|%H:%M ET}  %{y:+.2f}%<extra></extra>",
+        hovertemplate="%{x|%H:%M ET}  %{y:,.2f}<extra></extra>",
     ))
+
     fig.update_layout(
-        height=110,
-        margin=dict(l=45, r=5, t=4, b=28),
+        height=130,
+        margin=dict(l=4, r=38, t=6, b=26),
         xaxis=dict(
             visible=True, fixedrange=True,
             tickformat="%H:%M", nticks=4,
             tickfont=dict(size=9), showgrid=False,
         ),
         yaxis=dict(
-            visible=True, fixedrange=True,
-            tickfont=dict(size=9), nticks=3,
-            ticksuffix="%",
-            showgrid=True, gridcolor="rgba(128,128,128,0.15)",
-            zeroline=True, zerolinecolor="rgba(200,200,200,0.6)", zerolinewidth=1,
+            visible=True, fixedrange=True, side="right",
+            tickfont=dict(size=9), nticks=4, showgrid=False,
         ),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -2026,7 +2032,7 @@ def page_market_screen():
                     is_up     = (chgp or 0.0) >= 0
                     color_hex = "#26A69A" if is_up else "#EF5350"
 
-                    # 数値フォーマット
+                    # 価格フォーマット
                     if price is not None:
                         if price < 0.01:
                             price_str = f"{price:.6f}"
@@ -2039,24 +2045,22 @@ def page_market_screen():
                     else:
                         price_str = "---"
 
-                    # 前日比：絶対値 + % の両方を表示
-                    if chg is not None and chgp is not None:
-                        delta_str = f"{chg:+,.2f}  ({chgp:+.2f}%)"
-                    elif chgp is not None:
-                        delta_str = f"{chgp:+.2f}%"
-                    else:
-                        delta_str = None
+                    chgp_str = f"{chgp:+.2f}%" if chgp is not None else "---"
+                    chg_str  = f"{chg:+,.2f}"  if chg  is not None else ""
 
-                    st.metric(
-                        label=f"{name}  `{ticker}`",
-                        value=price_str,
-                        delta=delta_str,
+                    # ── カードヘッダー：銘柄名 + 前日比%（大きく）──
+                    st.markdown(
+                        f"<div style='font-size:11px;color:#999;margin-bottom:0px'>"
+                        f"{name}&nbsp;<code style='font-size:10px;color:#555'>{ticker}</code></div>"
+                        f"<div style='font-size:26px;font-weight:bold;color:{color_hex};line-height:1.15'>"
+                        f"{chgp_str}</div>",
+                        unsafe_allow_html=True,
                     )
 
-                    # イントラデイチャート（当日5分足・前日比%）→ なければ30日スパークライン
-                    pct = intraday.get(ticker)
-                    if pct is not None and len(pct) > 2:
-                        fig = _make_intraday_fig(pct)
+                    # ── チャート：当日5分足（価格ベース）→ なければ30日スパークライン ──
+                    idata = intraday.get(ticker)
+                    if idata is not None and len(idata["prices"]) > 2:
+                        fig = _make_intraday_fig(idata["prices"], idata["prev_close"])
                         st.plotly_chart(
                             fig,
                             use_container_width=True,
@@ -2073,6 +2077,14 @@ def page_market_screen():
                                 config={"staticPlot": True, "displayModeBar": False},
                                 key=f"spark_{ticker}",
                             )
+
+                    # ── カードフッター：現在値（大きく）+ 前日比絶対値 ──
+                    st.markdown(
+                        f"<div style='font-size:17px;font-weight:bold;color:#e0e0e0;margin-top:2px'>"
+                        f"{price_str}&nbsp;"
+                        f"<span style='font-size:13px;color:{color_hex}'>{chg_str}</span></div>",
+                        unsafe_allow_html=True,
+                    )
 
         st.markdown("---")
 
