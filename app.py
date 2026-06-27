@@ -1125,6 +1125,43 @@ def get_sparkline_data(tickers: tuple) -> dict:
     return result
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_intraday_data(tickers: tuple) -> dict:
+    """当日5分足の前日比(%)系列を並列取得して dict[ticker->Series] で返す"""
+    def _fetch(ticker: str):
+        try:
+            url = (
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+                f"?interval=5m&range=1d"
+            )
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(5, 10))
+            if r.status_code != 200:
+                return ticker, None
+            data = r.json().get("chart", {}).get("result", [])
+            if not data:
+                return ticker, None
+            meta       = data[0].get("meta", {})
+            prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+            timestamps = data[0].get("timestamp", [])
+            closes     = data[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            if not timestamps or not closes or not prev_close:
+                return ticker, None
+            times = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("America/New_York")
+            s = pd.Series(closes, index=times, dtype=float).dropna()
+            return ticker, (s / prev_close - 1) * 100
+        except Exception:
+            return ticker, None
+
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        futures = {ex.submit(_fetch, t): t for t in tickers}
+        for f in concurrent.futures.as_completed(futures):
+            t, data = f.result()
+            if data is not None and len(data) > 0:
+                result[t] = data
+    return result
+
+
 # =============================================================
 # セクター比較
 # =============================================================
@@ -1901,6 +1938,50 @@ def _make_sparkline_fig(closes: pd.Series, is_up: bool) -> "go.Figure":
     return fig
 
 
+def _make_intraday_fig(pct: pd.Series) -> "go.Figure":
+    """当日5分足の前日比(%)チャート。0以上は緑、0以下は赤で塗りつぶし"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=pct.index, y=pct.clip(lower=0),
+        mode="lines", line=dict(width=0),
+        fill="tozeroy", fillcolor="rgba(38,166,154,0.25)",
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=pct.index, y=pct.clip(upper=0),
+        mode="lines", line=dict(width=0),
+        fill="tozeroy", fillcolor="rgba(239,83,80,0.25)",
+        showlegend=False, hoverinfo="skip",
+    ))
+    last_color = "#26A69A" if (pct.iloc[-1] >= 0) else "#EF5350"
+    fig.add_trace(go.Scatter(
+        x=pct.index, y=pct.values,
+        mode="lines", line=dict(color=last_color, width=1.5),
+        showlegend=False,
+        hovertemplate="%{x|%H:%M ET}  %{y:+.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        height=110,
+        margin=dict(l=45, r=5, t=4, b=28),
+        xaxis=dict(
+            visible=True, fixedrange=True,
+            tickformat="%H:%M", nticks=4,
+            tickfont=dict(size=9), showgrid=False,
+        ),
+        yaxis=dict(
+            visible=True, fixedrange=True,
+            tickfont=dict(size=9), nticks=3,
+            ticksuffix="%",
+            showgrid=True, gridcolor="rgba(128,128,128,0.15)",
+            zeroline=True, zerolinecolor="rgba(200,200,200,0.6)", zerolinewidth=1,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    return fig
+
+
 def page_market_screen():
     st.title("🖥️ マーケットスクリーン")
     st.caption("世界主要指数・先物・マクロ・仮想通貨・個別株のリアルタイム一覧（30日スパークライン付き）")
@@ -1919,7 +2000,8 @@ def page_market_screen():
         st.rerun()
 
     with st.spinner("データ取得中..."):
-        quote_df   = get_quote_data(all_tickers)
+        quote_df  = get_quote_data(all_tickers)
+        intraday  = get_intraday_data(all_tickers)
         sparklines = get_sparkline_data(all_tickers)
 
     if not quote_df.empty:
@@ -1957,7 +2039,13 @@ def page_market_screen():
                     else:
                         price_str = "---"
 
-                    delta_str = f"{chgp:+.2f}%" if chgp is not None else None
+                    # 前日比：絶対値 + % の両方を表示
+                    if chg is not None and chgp is not None:
+                        delta_str = f"{chg:+,.2f}  ({chgp:+.2f}%)"
+                    elif chgp is not None:
+                        delta_str = f"{chgp:+.2f}%"
+                    else:
+                        delta_str = None
 
                     st.metric(
                         label=f"{name}  `{ticker}`",
@@ -1965,15 +2053,26 @@ def page_market_screen():
                         delta=delta_str,
                     )
 
-                    closes = sparklines.get(ticker)
-                    if closes is not None and len(closes) > 2:
-                        spark = _make_sparkline_fig(closes, is_up)
+                    # イントラデイチャート（当日5分足・前日比%）→ なければ30日スパークライン
+                    pct = intraday.get(ticker)
+                    if pct is not None and len(pct) > 2:
+                        fig = _make_intraday_fig(pct)
                         st.plotly_chart(
-                            spark,
+                            fig,
                             use_container_width=True,
-                            config={"staticPlot": True, "displayModeBar": False},
-                            key=f"spark_{ticker}",
+                            config={"staticPlot": False, "displayModeBar": False},
+                            key=f"intra_{ticker}",
                         )
+                    else:
+                        closes = sparklines.get(ticker)
+                        if closes is not None and len(closes) > 2:
+                            spark = _make_sparkline_fig(closes, is_up)
+                            st.plotly_chart(
+                                spark,
+                                use_container_width=True,
+                                config={"staticPlot": True, "displayModeBar": False},
+                                key=f"spark_{ticker}",
+                            )
 
         st.markdown("---")
 
