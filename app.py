@@ -1966,12 +1966,25 @@ def _make_intraday_fig(prices: pd.Series, prev_close: float) -> "go.Figure":
         x=prices.index, y=prices.values,
         mode="lines", line=dict(color=color_line, width=1.5),
         showlegend=False,
-        hovertemplate="%{x|%H:%M ET}  %{y:,.2f}<extra></extra>",
+        hovertemplate="%{x|%-m/%-d %H:%M} ET  %{y:,.2f}<extra></extra>",
     ))
+
+    # 取引日（米国東部・日本時間）を左上に注記
+    et_dt    = prices.index[-1]
+    jst_dt   = et_dt.tz_convert("Asia/Tokyo")
+    et_date  = f"{et_dt.month}/{et_dt.day}"
+    jst_date = f"{jst_dt.month}/{jst_dt.day}"
+    date_label = f"{jst_date}(JST)" if jst_date != et_date else f"{et_date}"
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.0, y=1.0,
+        text=date_label, showarrow=False,
+        font=dict(size=10, color="#888"),
+        xanchor="left", yanchor="top",
+    )
 
     fig.update_layout(
         height=130,
-        margin=dict(l=4, r=38, t=6, b=26),
+        margin=dict(l=4, r=38, t=14, b=26),
         xaxis=dict(
             visible=True, fixedrange=True,
             tickformat="%H:%M", nticks=4,
