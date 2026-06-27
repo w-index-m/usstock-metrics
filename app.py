@@ -1871,18 +1871,29 @@ _SCREEN_SECTIONS = [
 
 
 def _make_sparkline_fig(closes: pd.Series, is_up: bool) -> "go.Figure":
-    color     = "#26A69A" if is_up else "#EF5350"
-    fill      = "rgba(38,166,154,0.15)" if is_up else "rgba(239,83,80,0.15)"
+    color = "#26A69A" if is_up else "#EF5350"
+    fill  = "rgba(38,166,154,0.15)" if is_up else "rgba(239,83,80,0.15)"
     fig = go.Figure(go.Scatter(
-        y=closes.values, mode="lines",
+        x=closes.index,
+        y=closes.values,
+        mode="lines",
         line=dict(color=color, width=1.5),
         fill="tozeroy", fillcolor=fill,
-        hoverinfo="skip",
+        hovertemplate="%{x|%m/%d}  %{y:,.2f}<extra></extra>",
     ))
     fig.update_layout(
-        height=55, margin=dict(l=0, r=0, t=0, b=0),
-        xaxis=dict(visible=False, fixedrange=True),
-        yaxis=dict(visible=False, fixedrange=True),
+        height=110,
+        margin=dict(l=50, r=5, t=4, b=28),
+        xaxis=dict(
+            visible=True, fixedrange=True,
+            tickformat="%m/%d", nticks=3,
+            tickfont=dict(size=9), showgrid=False,
+        ),
+        yaxis=dict(
+            visible=True, fixedrange=True,
+            tickfont=dict(size=9), nticks=3,
+            showgrid=True, gridcolor="rgba(128,128,128,0.2)",
+        ),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
