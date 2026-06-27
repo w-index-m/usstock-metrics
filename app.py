@@ -2010,7 +2010,7 @@ def page_market_screen():
         intraday  = get_intraday_data(all_tickers)
         sparklines = get_sparkline_data(all_tickers)
 
-    if not quote_df.empty:
+    if not quote_df.empty or intraday:
         ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         col_ts.caption(f"最終取得: {ts} (UTC)")
 
@@ -2028,6 +2028,14 @@ def page_market_screen():
                     price = float(q.iloc[0]["現在値"])  if not q.empty and pd.notna(q.iloc[0]["現在値"])  else None
                     chg   = float(q.iloc[0]["前日比"])  if not q.empty and pd.notna(q.iloc[0]["前日比"])  else None
                     chgp  = float(q.iloc[0]["前日比%"]) if not q.empty and pd.notna(q.iloc[0]["前日比%"]) else None
+
+                    # v7 quote が失敗した場合はイントラデイ(v8)から現在値・前日比を算出
+                    idata = intraday.get(ticker)
+                    if price is None and idata is not None and len(idata["prices"]) > 0:
+                        price      = float(idata["prices"].iloc[-1])
+                        prev_close = idata["prev_close"]
+                        chg        = price - prev_close
+                        chgp       = (price / prev_close - 1) * 100 if prev_close else None
 
                     is_up     = (chgp or 0.0) >= 0
                     color_hex = "#26A69A" if is_up else "#EF5350"
@@ -2058,7 +2066,6 @@ def page_market_screen():
                     )
 
                     # ── チャート：当日5分足（価格ベース）→ なければ30日スパークライン ──
-                    idata = intraday.get(ticker)
                     if idata is not None and len(idata["prices"]) > 2:
                         fig = _make_intraday_fig(idata["prices"], idata["prev_close"])
                         st.plotly_chart(
@@ -2080,7 +2087,7 @@ def page_market_screen():
 
                     # ── カードフッター：現在値（大きく）+ 前日比絶対値 ──
                     st.markdown(
-                        f"<div style='font-size:17px;font-weight:bold;color:#e0e0e0;margin-top:2px'>"
+                        f"<div style='font-size:18px;font-weight:bold;color:var(--text-color);margin-top:2px'>"
                         f"{price_str}&nbsp;"
                         f"<span style='font-size:13px;color:{color_hex}'>{chg_str}</span></div>",
                         unsafe_allow_html=True,
