@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+<title id="title">Market screen image</title><desc id="desc">Illustration of the usstock metrics market screen</desc>
+<rect width="1200" height="620" rx="16" fill="#0e1117"/>
+<rect width="220" height="620" rx="16" fill="#171b24"/>
+<text x="28" y="45" fill="#fff" font-size="22" font-family="Arial">🚀 米国株ダッシュボード</text>
+<text x="28" y="90" fill="#8ab4f8" font-size="16" font-family="Arial">📑 ページ選択</text>
+<g fill="#d7dbe3" font-size="15" font-family="Arial"><text x="28" y="130">🖥️ マーケットスクリーン</text><text x="28" y="165">📈 マーケット概況</text><text x="28" y="200">📊 パフォーマンス分析</text><text x="28" y="235">📉 テクニカル分析</text><text x="28" y="270">📋 決算分析</text><text x="28" y="305">📰 ニュース翻訳</text><text x="28" y="340">🚀 モメンタムランキング</text></g>
+<text x="255" y="50" fill="#fff" font-size="30" font-family="Arial">🖥️ マーケットスクリーン</text>
+<text x="255" y="82" fill="#a9b1bd" font-size="15" font-family="Arial">主要指数・先物・マクロ・暗号資産・大型テック株</text>
+<g font-family="Arial"><g fill="#202632"><rect x="255" y="115" width="210" height="155" rx="10"/><rect x="485" y="115" width="210" height="155" rx="10"/><rect x="715" y="115" width="210" height="155" rx="10"/><rect x="945" y="115" width="210" height="155" rx="10"/></g><g fill="#a9b1bd" font-size="14"><text x="275" y="145">S&amp;P 500</text><text x="505" y="145">NASDAQ 100</text><text x="735" y="145">VIX</text><text x="965" y="145">AAPL</text></g><g fill="#31c48d" font-size="25"><text x="275" y="185">+0.84%</text><text x="505" y="185">+1.12%</text><text x="735" y="185">-3.40%</text><text x="965" y="185">+2.05%</text></g><g stroke="#31c48d" stroke-width="3" fill="none"><path d="M275 235 L310 215 L345 225 L380 180 L420 195 L445 155"/><path d="M505 235 L540 225 L575 205 L610 218 L650 160 L675 175"/><path d="M735 235 L770 190 L805 210 L845 175 L885 195"/><path d="M965 235 L1000 225 L1035 235 L1075 175 L1125 185"/></g></g>
+<text x="255" y="330" fill="#fff" font-size="20" font-family="Arial">📊 マクロ / 商品 / 為替</text>
+<rect x="255" y="350" width="900" height="190" rx="10" fill="#202632"/><g fill="#d7dbe3" font-family="Arial" font-size="16"><text x="285" y="390">VIX　 18.42</text><text x="500" y="390">米10年債　 4.25%</text><text x="750" y="390">Gold　 $2,350.10</text><text x="965" y="390">WTI　 $78.20</text><text x="285" y="450">USD/JPY　 156.20</text><text x="500" y="450">Bitcoin　 $65,420</text><text x="750" y="450">Ethereum　 $3,420</text><text x="965" y="450">更新　 15:42 JST</text></g>
+</svg>
